@@ -1,0 +1,4 @@
+name=PZLab Harness
+id=PZLabHarness
+description=Automation harness for the pzlab test apparatus: file-based Lua command bridge, world autostart and test helpers. Lab profiles only.
+modversion=0.1.0

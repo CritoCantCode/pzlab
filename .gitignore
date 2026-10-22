@@ -1,0 +1,5 @@
+# Runtime game profiles (-cachedir) and this machine's config
+profile*/
+lab.local.json
+__pycache__/
+*.pyc

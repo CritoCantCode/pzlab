@@ -1,0 +1,12 @@
+{
+  "resolution": [1280, 720],
+  "game_args": ["-debug", "-nosteam", "-nosound", "-novoip"],
+  "world": {
+    "map": "Muldraugh, KY",
+    "x": 6119, "y": 5474, "z": 0,
+    "sandbox": {"Zombies": 6},
+    "god": true,
+    "closeUI": ["UIDebugConsole", "ISCharacterInfoWindow"]
+  },
+  "keep_saves": 3
+}
