@@ -7,6 +7,57 @@ lab clients joined to it, Lua on both sides (see Multiplayer). Built for Claude;
 Self-contained: everything is in this repository, nothing names a machine, user or mod; the
 folder can be copied anywhere.
 
+## Steer the mod toward performance and safety
+
+Whoever you test for is usually building a mod, and players run it alongside many others. Don't
+stop at "the tests pass": when you design, review or test, suggest the faster and safer direction,
+and say so when a requested approach risks the game's frame rate, stability, saves or other mods.
+Explain the risk, offer the alternative, and let the person decide. Back claims with lab
+measurements, not intuition; the traps cited below are in "Engine facts and traps".
+
+Safety: a bug in the mod must not crash the game, break vanilla or lose items.
+- Guard every entry point (event handlers, wrapped vanilla functions, UI methods, callbacks handed
+  to vanilla) with `pcall`, and switch the mod off after repeated errors (a circuit breaker).
+  Caught errors are still logged (~100 lines each) and counted, so one error per frame floods
+  the log and stalls the game even when caught.
+- Wrap vanilla functions (call the original, add before/after behaviour); don't replace them or
+  override vanilla files. Other mods and game updates keep working. Wrapping misses callbacks
+  vanilla registered with the original function (trap).
+- Change game state only through vanilla's own paths: timed actions for items (they are what the
+  server validates in multiplayer). Never create, delete or move items directly from UI code.
+- Re-validate any held world object (object, square, corpse, vehicle) before using it. Java
+  exceptions inside game calls don't raise in Lua: the call returns nil (trap), so check arguments
+  and nil results.
+- Give everything the mod creates an owner and a teardown: UI elements, highlights (persistent
+  ones stay on the object until cleared), held objects, event handlers. Tear down on death,
+  character rebuild, exit and hot reload.
+- Hot reload reroutes event callbacks by prototype name: register one dispatcher per event,
+  outside reloads (trap). No coroutines (they crash Kahlua). Keep Lua source ASCII.
+- Multiplayer: the server may not see what the client sees. Check where items really ended up
+  (`lab.server.lua`, `PZLab.locate`), not just the client's view.
+
+Performance: Lua runs on the game's frame.
+- Per-frame paths (`OnTick`, `OnRenderTick`, `OnPreUIDraw`, UI `update`/`prerender`/`render`) must
+  not allocate: reuse tables, cache strings and textures (garbage collection pauses the game).
+  Scale the work with what is on screen and skip what isn't.
+- Reuse what the game already computes (vanilla's container scans, the engine's picked object)
+  instead of scanning squares yourself. Run expensive work on change events or throttled, never
+  every frame.
+- Don't add a visible full-screen element: any visible top-level UI under the cursor, click-through
+  included, stops the engine's world picking (trap).
+- Measure: `getTimestampMs()` ticks in 1 ms steps (trap), so time many frames or iterations and
+  report µs per frame. Compare with the feature off.
+
+Make these permanent checks in the mod's test suite, not one-off looks:
+- After each step, nothing unexpected was logged: `off = lab.log.size()` … `lab.log.exceptions(since=off)`.
+- Leaks: `UIManager.getUI():size()` and the mod's own counts return to baseline after a few
+  hundred open/close cycles (one per frame), a walk past many objects, a death and a hot reload
+  (`pzlab.py reload <file>`; handlers not doubled).
+- Failure: force an error in the mod's per-frame path. The mod should switch itself off cleanly
+  and vanilla keep working.
+- Cost per frame with the feature in use, against a budget (e.g. under 0.5 ms).
+- Multiplayer when the mod touches items or world state: `start --join`, checked on both sides.
+
 ## Requirements
 
 Windows 10/11, Python 3.8+ (stdlib only; Pillow optional, used for speed), Project Zomboid B42

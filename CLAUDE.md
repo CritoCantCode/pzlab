@@ -6,6 +6,8 @@ Test apparatus that drives a real Project Zomboid (Build 42) instance for automa
 
 pzlab serves every future AI instance and the people they work for, whatever mod they are building. When a task for one mod reveals a missing capability, build it as a general tool (generic names, documented in AGENT.md, verified live), never as a shortcut shaped around that mod.
 
+AGENT.md opens with "Steer the mod toward performance and safety": agents using pzlab should propose fast, safe directions for the mod, not just make its tests pass. When you verify a new engine trap that bears on a mod's speed or stability, add it there too (one line, citing the trap).
+
 ## Rules
 
 - Stay agnostic: no machine paths, user names or mod-specific code in committed files. Machine settings go in `lab.local.json` (gitignored, written by `pzlab.py init`); mods arrive via `--mod-dir`. Mod-specific test scripts live in the mod's own repo.
