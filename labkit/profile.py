@@ -3,6 +3,7 @@ autostart request. Everything written here stays inside the profile directory.""
 
 import os
 import shutil
+import time
 from pathlib import Path
 
 from . import detect
@@ -82,9 +83,9 @@ def _make_link(target, link):
         os.symlink(target, link, target_is_directory=True)
 
 
-def link_mods(cfg):
-    """Links every configured mod folder into <profile>/mods/<name>."""
-    mods_dir = cfg.profile_dir / "mods"
+def link_mods(cfg, mods_dir=None):
+    """Links every configured mod folder into <profile>/mods/<name> (or into mods_dir)."""
+    mods_dir = mods_dir or cfg.profile_dir / "mods"
     for name, target in cfg.mods.items():
         detect.mod_root(target)  # validates the layout
         link = mods_dir / name
@@ -191,11 +192,12 @@ def write_autostart(cfg, world):
     (cfg.lua_dir / "autostart.txt").write_text("return " + to_lua(world) + "\n", encoding="utf-8")
 
 
-def clear_runtime_files(cfg):
+def clear_runtime_files(cfg, lua_dir=None):
     """Bridge files of a previous run (removed before launch, so nothing reads them meanwhile)."""
-    if not cfg.lua_dir.exists():
+    lua_dir = lua_dir or cfg.lua_dir
+    if not lua_dir.exists():
         return
-    for path in cfg.lua_dir.iterdir():
+    for path in lua_dir.iterdir():
         name = path.name
         if (name in ("cmd.txt", "cmd.tmp", "res.json", "state.json", "autostart.txt")
                 or (name.startswith("cmd-") and name.endswith((".txt", ".go")))):
@@ -215,16 +217,126 @@ def clear_lua_scratch(cfg):
     return count
 
 
-def prune_saves(cfg, keep):
-    """Deletes all but the newest `keep` worlds under <profile>/Saves/*/."""
-    saves = cfg.profile_dir / "Saves"
-    if not saves.exists():
-        return []
-    worlds = [w for mode in saves.iterdir() if mode.is_dir() for w in mode.iterdir() if w.is_dir()]
-    worlds.sort(key=lambda w: w.stat().st_mtime, reverse=True)
+def prune_saves(cfg, keep, root=None, worlds=None):
+    """Deletes all but the newest `keep` worlds under <profile>/Saves/*/ (root: another profile;
+    worlds: an explicit list of world folders to choose from)."""
+    root = root or cfg.profile_dir
+    saves = root / "Saves"
+    if worlds is None:
+        if not saves.exists():
+            return []
+        worlds = [w for mode in saves.iterdir() if mode.is_dir() for w in mode.iterdir() if w.is_dir()]
+    worlds = sorted(worlds, key=lambda w: w.stat().st_mtime, reverse=True)
     removed = []
     for w in worlds[keep:]:
-        if cfg.profile_dir in w.resolve().parents:
+        if root in w.resolve().parents:
             shutil.rmtree(w, ignore_errors=True)
             removed.append(w.name)
     return removed
+
+
+# Lab server profile (the dedicated server's -cachedir) ------------------------------------
+
+# Server/<name>.ini values the lab always sets (lab.json "server.options" goes on top): nothing
+# public, no router port mapping (UPnP), no Steam, no backups, no voice, no welcome chat.
+LAB_SERVER_OPTIONS = {
+    "Public": "false",
+    "UPnP": "false",
+    "SteamVAC": "false",
+    "SteamScoreboard": "false",
+    "VoiceEnable": "false",
+    "BackupsOnStart": "false",
+    "BackupsOnVersionChange": "false",
+    "BackupsPeriod": "0",
+    "ServerWelcomeMessage": "",
+    "Open": "true",
+    "Password": "",
+    "WorkshopItems": "",
+    "RCONPassword": "",
+}
+
+
+def ensure_server_dirs(cfg):
+    root = cfg.server_profile_dir
+    for d in (root, root / "mods", root / "Server", cfg.server_lua_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def _update_ini(path, values):
+    """Sets key=value lines in an ini-style file (keeps other lines), appending missing keys."""
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines() if path.exists() else []
+    seen, out = set(), []
+    for line in lines:
+        key = line.split("=", 1)[0]
+        if key in values and not line.startswith("#"):
+            out.append("%s=%s" % (key, values[key]))
+            seen.add(key)
+        else:
+            out.append(line)
+    out += ["%s=%s" % (k, v) for k, v in values.items() if k not in seen]
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def server_options(cfg, mod_ids, world):
+    """The Server/<name>.ini values for this start."""
+    server = cfg["server"]
+    values = dict(LAB_SERVER_OPTIONS)
+    values.update({
+        "DefaultPort": str(server["port"]),
+        "UDPPort": str(server["udp_port"]),
+        "Map": world.get("map") or "Muldraugh, KY",
+        "Mods": ";".join(mod_ids),
+        "SpawnPoint": "%d,%d,%d" % (int(world["x"]), int(world["y"]), int(world.get("z") or 0)),
+    })
+    values.update({k: _ini_value(v) for k, v in server["options"].items()})
+    return values
+
+
+def _ini_value(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+
+def write_server_files(cfg, mod_ids, world):
+    """Server/<name>.ini (lab options), <name>_SandboxVars.lua (world sandbox overrides on the
+    defaults), <name>_spawnregions.lua + <name>_spawnpoints.lua (one region: every new character
+    spawns at world x, y, z, so the client skips the spawn-region choice)."""
+    name = cfg["server"]["name"]
+    folder = cfg.server_profile_dir / "Server"
+    values = server_options(cfg, mod_ids, world)
+    _update_ini(folder / (name + ".ini"), values)
+    version = detect.class_int_constant(cfg.game_dir, "zombie/SandboxOptions", "SANDBOX_VERSION")
+    sandbox = dict(world.get("sandbox") or {})
+    body = "".join("    [%s] = %s,\n" % (lua_string(str(k)), to_lua(v)) for k, v in sandbox.items())
+    # VERSION must match the game's, or the loader "upgrades" the table from version 0.
+    (folder / (name + "_SandboxVars.lua")).write_text(
+        "SandboxVars = {\n    VERSION = %d,\n%s}\n" % (version or 6, body), encoding="utf-8")
+    (folder / (name + "_spawnregions.lua")).write_text(
+        "function SpawnRegions()\n    return {\n        { name = %s, serverfile = %s },\n    }\nend\n"
+        % (lua_string(values["Map"]), lua_string(name + "_spawnpoints.lua")), encoding="utf-8")
+    (folder / (name + "_spawnpoints.lua")).write_text(
+        "function SpawnPoints()\n    return {\n        unemployed = { { posX = %d, posY = %d, posZ = %d } },\n"
+        "    }\nend\n" % (int(world["x"]), int(world["y"]), int(world.get("z") or 0)), encoding="utf-8")
+    return values
+
+
+def archive_server_world(cfg, keep):
+    """Moves the server's world (Saves/Multiplayer/<name>) and user database (db/<name>.db) to
+    Saves/Multiplayer/<name>_<time>/, so the next start creates a fresh world; keeps the newest
+    `keep` archives. Returns {archived, pruned}."""
+    name = cfg["server"]["name"]
+    root = cfg.server_profile_dir
+    saves = root / "Saves" / "Multiplayer"
+    world, db = saves / name, root / "db" / (name + ".db")
+    archived = None
+    if world.exists() or db.exists():
+        archived = saves / ("%s_%s" % (name, time.strftime("%Y%m%d_%H%M%S")))
+        archived.mkdir(parents=True, exist_ok=True)
+        if world.exists():
+            shutil.move(str(world), str(archived / name))
+        if db.exists():
+            shutil.move(str(db), str(archived / db.name))
+    old = [w for w in saves.iterdir() if w.is_dir() and w.name.startswith(name + "_")] if saves.exists() else []
+    return {"archived": archived.name if archived else None,
+            "pruned": prune_saves(cfg, keep, root=root, worlds=old)}

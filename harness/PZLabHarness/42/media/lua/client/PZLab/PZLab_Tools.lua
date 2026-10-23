@@ -1,8 +1,9 @@
--- PZLab helpers for command chunks: player/world access, projection to screen pixels,
--- object and UI inspection, item spawning. Everything returns plain tables so results
--- serialize cleanly through PZLab.json.
+-- PZLab client helpers for command chunks: teleport, projection to screen pixels, picking and
+-- hover checks, UI inspection, items, Lua file loading. World access and inspection shared with
+-- the server (player, square, describeObject, whereIs, ...) are in shared/PZLab_Inspect.lua.
 
 require "PZLab/PZLab_Core"
+require "PZLab/PZLab_Inspect"
 
 local P = 0
 
@@ -11,21 +12,19 @@ local function className(obj)
     return ok and tostring(name) or "?"
 end
 
-function PZLab.player()
-    return getSpecificPlayer(P)
-end
-
-function PZLab.square(x, y, z)
-    return getCell():getGridSquare(x, y, z or 0)
-end
-
 -- Whole-number x/y land on the tile centre; fractional ones are used as given.
 -- (Kahlua resolves teleportTo(x, y, z) to the int overload, which truncates to the tile
 -- corner, so the exact position is set afterwards.)
+-- Multiplayer: asks the server (`/teleportto`, admin) and returns at once with sent = true; the
+-- player arrives a few frames later. Use PZLab.gotoLocation / lab.goto, which wait for it.
 function PZLab.teleport(x, y, z)
     local player = PZLab.player()
     local fx = (x == math.floor(x)) and x + 0.5 or x
     local fy = (y == math.floor(y)) and y + 0.5 or y
+    if isClient() then
+        SendCommandToServer(string.format("/teleportto %.3f,%.3f,%d", fx, fy, math.floor(z or 0)))
+        return { x = fx, y = fy, z = z or 0, sent = true }
+    end
     player:teleportTo(math.floor(fx), math.floor(fy), z or 0)
     player:setX(fx)
     player:setY(fy)
@@ -247,100 +246,6 @@ end
 -- Inspection
 ---------------------------------------------------------------------------------------------
 
-function PZLab.describeContainer(c)
-    if not c then return nil end
-    local d = { type = c:getType(), items = c:getItems():size() }
-    local holder = c:getContainingItem()
-    if holder then d.inItem = holder:getFullType() end
-    return d
-end
-
--- Item containers an object holds: tile object containers, a corpse's inventory, a vehicle's
--- part containers, or a floor item's own inventory (bags).
-function PZLab.containersOf(obj)
-    local out = {}
-    if instanceof(obj, "BaseVehicle") then
-        for i = 0, obj:getPartCount() - 1 do
-            local c = obj:getPartByIndex(i):getItemContainer()
-            if c then out[#out + 1] = c end
-        end
-    elseif instanceof(obj, "IsoWorldInventoryObject") then
-        local item = obj:getItem()
-        if item and instanceof(item, "InventoryContainer") then out[1] = item:getInventory() end
-    else
-        for i = 0, obj:getContainerCount() - 1 do out[#out + 1] = obj:getContainerByIndex(i) end
-        if #out == 0 and instanceof(obj, "IsoDeadBody") and obj:getContainer() then out[1] = obj:getContainer() end
-    end
-    return out
-end
-
-function PZLab.describeObject(obj)
-    if not obj then return nil end
-    local d = { class = className(obj), str = tostring(obj) }
-    local sq = obj:getSquare()
-    if sq then d.at = { sq:getX(), sq:getY(), sq:getZ() } end
-    d.sprite = obj:getSpriteName()
-    d.name = obj:getObjectName()
-    local containers = PZLab.containersOf(obj)
-    if #containers > 0 then
-        d.containers = {}
-        for i, c in ipairs(containers) do d.containers[i] = PZLab.describeContainer(c) end
-    end
-    if instanceof(obj, "IsoWorldInventoryObject") then
-        local item = obj:getItem()
-        d.item = item and item:getFullType()
-    elseif instanceof(obj, "IsoDeadBody") then
-        d.female = obj:isFemale()
-    elseif instanceof(obj, "BaseVehicle") then
-        d.script = obj:getScriptName()
-    end
-    if instanceof(obj, "IsoMovingObject") then d.pos = { obj:getX(), obj:getY(), obj:getZ() } end
-    d.screen = PZLab.objectScreenPos(obj)
-    return d
-end
-
--- Everything on a square: tile objects, world items, corpses.
-function PZLab.objectsAt(x, y, z)
-    local sq = PZLab.square(x, y, z)
-    if not sq then return nil end
-    local out = {}
-    local objects = sq:getObjects()
-    for i = 0, objects:size() - 1 do
-        out[#out + 1] = PZLab.describeObject(objects:get(i))
-    end
-    local statics = sq:getStaticMovingObjects()
-    for i = 0, statics:size() - 1 do
-        out[#out + 1] = PZLab.describeObject(statics:get(i))
-    end
-    return out
-end
-
--- Tile objects with containers within `radius` tiles of the player (same floor), nearest first.
-function PZLab.findContainers(radius)
-    local player = PZLab.player()
-    local px, py, pz = math.floor(player:getX()), math.floor(player:getY()), math.floor(player:getZ())
-    radius = radius or 6
-    local out = {}
-    for dy = -radius, radius do
-        for dx = -radius, radius do
-            local sq = PZLab.square(px + dx, py + dy, pz)
-            if sq then
-                local objects = sq:getObjects()
-                for i = 0, objects:size() - 1 do
-                    local obj = objects:get(i)
-                    if obj:getContainerCount() > 0 then
-                        local d = PZLab.describeObject(obj)
-                        d.dist = math.sqrt(dx * dx + dy * dy)
-                        out[#out + 1] = d
-                    end
-                end
-            end
-        end
-    end
-    table.sort(out, function(a, b) return a.dist < b.dist end)
-    return out
-end
-
 -- Top-level UI elements, front-most last.
 function PZLab.ui(includeHidden)
     local list = UIManager.getUI()
@@ -409,11 +314,6 @@ function PZLab.give(fullType, count)
     return #added
 end
 
-function PZLab.addToContainer(container, fullType, count)
-    for _ = 1, count or 1 do container:AddItem(fullType) end
-    return container:getItems():size()
-end
-
 function PZLab.screenshot(name)
     takeScreenshot(name or "pzlab")
     return true
@@ -476,4 +376,141 @@ function PZLab.loadLua(path, source, hot, afterPath)
     end
     if afterPath then reloadLuaFile(afterPath) end
     return result
+end
+
+---------------------------------------------------------------------------------------------
+-- Timed actions
+---------------------------------------------------------------------------------------------
+
+-- True while the player has timed actions queued or running (walk-to, transfers, ...) or is in
+-- an action state (climbing, opening windows); the same test vanilla uses plus the Lua queue.
+function PZLab.playerBusy(player)
+    player = player or PZLab.player()
+    if not player then return false end
+    local queue = ISTimedActionQueue.queues[player]
+    if queue and #queue.queue > 0 then return true end
+    return ISTimedActionQueue.isPlayerDoingAction(player) and true or false
+end
+
+-- The player's timed-action queue: { busy, queued = { Type, ... } } (first = running).
+function PZLab.actionQueue(player)
+    player = player or PZLab.player()
+    local queue = ISTimedActionQueue.queues[player]
+    local types = {}
+    if queue then
+        for i, action in ipairs(queue.queue) do types[i] = action.Type or tostring(action) end
+    end
+    return { busy = PZLab.playerBusy(player), queued = types }
+end
+
+-- Timed-action tracing: the lifecycle of every action of the traced classes, as it happens. Wraps
+-- the classes' methods (waitToStart, start, update, perform, stop, forceComplete, forceStop) until
+-- PZLab.traceActions(false); the originals are restored exactly (inherited methods stay
+-- inherited). Records: PZLab.actionTrace() -> { n, type, item = {type, id}, src, dest (container
+-- types), queued, first (first call), started, ended (ms since tracing began), result =
+-- "performed" | "stopped" | nil (still running), waits (waitToStart calls), updates, maxTime
+-- (latest; -1 = an MP client still waiting for the server's duration), events = { {name, t,
+-- maxTime} } }. In multiplayer an ISInventoryTransferAction asks the server for an item
+-- transaction in start(), waits for its duration (maxTime -1 until then) and ends with
+-- forceComplete (done) or forceStop (rejected); one that never hears back never ends.
+PZLab.actionTraces = PZLab.actionTraces or {}
+PZLab.actionTraceOriginals = PZLab.actionTraceOriginals or {}
+local TRACED_METHODS = { "waitToStart", "start", "update", "perform", "stop", "forceComplete", "forceStop" }
+local MAX_TRACE_EVENTS = 40
+
+local function traceNow()
+    return getTimestampMs() - (PZLab.actionTraceStart or getTimestampMs())
+end
+
+-- The trace record of an action (created on first sight); `queued` when called before it runs.
+function PZLab.traceAction(action, queued)
+    local rec = rawget(action, "__pzlabTrace")
+    if rec then return rec end
+    rec = { n = #PZLab.actionTraces + 1, type = action.Type, events = {}, waits = 0, updates = 0 }
+    local item = rawget(action, "item")
+    if item and instanceof(item, "InventoryItem") then rec.item = { type = item:getFullType(), id = item:getID() } end
+    local src, dest = rawget(action, "srcContainer"), rawget(action, "destContainer")
+    if src and instanceof(src, "ItemContainer") then rec.src = src:getType() end
+    if dest and instanceof(dest, "ItemContainer") then rec.dest = dest:getType() end
+    if queued then rec.queued = traceNow() else rec.first = traceNow() end
+    rawset(action, "__pzlabTrace", rec)
+    PZLab.actionTraces[#PZLab.actionTraces + 1] = rec
+    return rec
+end
+
+local function traceEvent(action, name)
+    local rec = PZLab.traceAction(action)
+    local t = traceNow()
+    rec.first = rec.first or t
+    local maxTime = rawget(action, "maxTime")
+    if name == "waitToStart" then
+        rec.waits = rec.waits + 1
+        return
+    end
+    if name == "update" then
+        rec.updates = rec.updates + 1
+        if rec.updates > 1 and maxTime == rec.maxTime then return end
+    end
+    rec.maxTime = maxTime
+    if name == "start" then rec.started = t end
+    if name == "perform" then rec.result, rec.ended = "performed", t end
+    if name == "stop" and not rec.result then rec.result, rec.ended = "stopped", t end
+    if #rec.events < MAX_TRACE_EVENTS then rec.events[#rec.events + 1] = { name = name, t = t, maxTime = maxTime } end
+end
+
+-- classNames: list of action class names (default { "ISInventoryTransferAction" }); false stops
+-- tracing and restores the methods. Clears the records when starting. Returns the traced names.
+function PZLab.traceActions(classNames)
+    for name, saved in pairs(PZLab.actionTraceOriginals) do
+        local cls = _G[name]
+        if cls then
+            for _, m in ipairs(TRACED_METHODS) do rawset(cls, m, saved[m] or nil) end
+        end
+    end
+    PZLab.actionTraceOriginals = {}
+    if classNames == false then return {} end
+    PZLab.actionTraces = {}
+    PZLab.actionTraceStart = getTimestampMs()
+    local traced = {}
+    for _, name in ipairs(classNames or { "ISInventoryTransferAction" }) do
+        local cls = _G[name]
+        if type(cls) ~= "table" then error("no timed-action class " .. tostring(name)) end
+        local saved = {}
+        for _, m in ipairs(TRACED_METHODS) do
+            saved[m] = rawget(cls, m)
+            local original = cls[m]
+            if original then
+                local method = m
+                rawset(cls, m, function(self, ...)
+                    traceEvent(self, method)
+                    return original(self, ...)
+                end)
+            end
+        end
+        PZLab.actionTraceOriginals[name] = saved
+        traced[#traced + 1] = name
+    end
+    return traced
+end
+
+-- The records so far (see traceActions); clear = true empties the list afterwards.
+function PZLab.actionTrace(clear)
+    local out = PZLab.actionTraces
+    if clear then PZLab.actionTraces = {} end
+    return out
+end
+
+-- Clear weather for screenshots, the way the admin panel's climate controls do it: admin
+-- overrides for fog and precipitation set to 0 (the fog fades out over a few seconds). In
+-- multiplayer they are sent to the server (transmitClientChangeAdminVars), which applies them for
+-- everyone; that needs an admin account. Returns true.
+function PZLab.clearWeather()
+    local cm = getClimateManager()
+    for _, index in ipairs({ ClimateManager.FLOAT_FOG_INTENSITY, ClimateManager.FLOAT_PRECIPITATION_INTENSITY }) do
+        local option = cm:getClimateFloat(index)
+        option:setEnableAdmin(true)
+        option:setAdminValue(0)
+    end
+    if isClient() then cm:transmitClientChangeAdminVars() end
+    return true
 end

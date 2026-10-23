@@ -1,9 +1,14 @@
 -- PZLab harness core: namespace, logging, JSON encoding and the file helpers the external
 -- controller (pzlab/pzlab.py) talks through. All files live under <cachedir>/Lua/pzlab/.
+-- shared/: loaded by the game client and by a dedicated server (lab server, see AGENT.md
+-- "Multiplayer"); client/ only by the client; server/ by both, its files return early unless
+-- isServer().
 
 PZLab = PZLab or {}
-PZLab.VERSION = "0.1.0"
+PZLab.VERSION = "0.2.0"
 PZLab.DIR = "pzlab/"
+-- true in a dedicated server's Lua state (no UI, no local player)
+PZLab.onServer = isServer() == true
 
 function PZLab.log(msg)
     print("[PZLab] " .. tostring(msg))
@@ -13,7 +18,9 @@ end
 -- harness) until someone clicks Resume, even an error caught by pcall. The lab must log errors
 -- and keep running instead. GameWindow.enter() turns the option back on right after OnGameBoot,
 -- i.e. after this file loads, so the bridge applies this again on its first tick.
+-- (A dedicated server has no Lua debugger window.)
 function PZLab.disableDebuggerOnError()
+    if PZLab.onServer or not UIManager then return end
     pcall(function() UIManager.setShowLuaDebuggerOnError(false) end)
 end
 PZLab.disableDebuggerOnError()

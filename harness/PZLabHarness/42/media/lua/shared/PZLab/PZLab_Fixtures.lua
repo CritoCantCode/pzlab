@@ -1,8 +1,14 @@
 -- PZLab fixtures: lab-only world setup a test can create, refer back to by handle and remove
--- again. Items, floor items, corpses and vehicles made here are tracked; clearFixtures()
--- removes whatever of them still exists, wherever it has moved to. Creation is direct
--- (AddItem, AddWorldInventoryItem, ...) because this is test setup, not gameplay; mods under
--- test must still move items only through vanilla timed actions.
+-- again. Items, floor items, world containers, corpses and vehicles made here are tracked;
+-- clearFixtures() removes whatever of them still exists, wherever it has moved to. Creation is
+-- direct (AddItem, AddWorldInventoryItem, ...) because this is test setup, not gameplay; mods
+-- under test must still move items only through vanilla timed actions.
+--
+-- Shared: in single player and on a dedicated (lab) server. On a server every creation and
+-- removal is also sent to the clients (sendAddItemToContainer, transmitCompleteItemToClients,
+-- ...). On a multiplayer client they refuse to run (MP_CLIENT_ERROR): objects made there exist
+-- only in that client, the server rejects any action on them. Set PZLab.allowClientFixtures =
+-- true to make such client-only objects anyway.
 --
 -- Item spec (addItems, contents options): a list of entries, each
 --   "Base.Apple"                         one item
@@ -10,15 +16,55 @@
 --   { "Base.Bag_Schoolbag", 1, contents = { ...spec } }   container items, filled recursively
 
 require "PZLab/PZLab_Core"
-require "PZLab/PZLab_Tools"
+require "PZLab/PZLab_Inspect"
 
 PZLab.fixtureList = PZLab.fixtureList or {}
 
+local MP_CLIENT_ERROR = "fixtures made on a multiplayer client exist only in that client (the server "
+    .. "rejects actions on them); create them on the server: lab.server.lua(...) / pzlab.py server lua"
+
+-- Fixture creation on an MP client: error unless PZLab.allowClientFixtures.
+local function checkSide()
+    if isClient() and not PZLab.allowClientFixtures then error(MP_CLIENT_ERROR, 3) end
+end
+
+-- On a server, tells the clients about an item added to a container (with its contents).
+local function syncAdd(container, item)
+    if PZLab.onServer then sendAddItemToContainer(container, item) end
+end
+
+-- Fixture entries: { kind, obj, id (items), at = {x, y, z} (where it was placed) }. Objects,
+-- corpses and vehicles also get modData.pzlabFixture: when their chunk unloads and loads again
+-- the world holds new Java objects (items keep their ids), which clearFixtures finds again.
 local function track(kind, obj)
     local list = PZLab.fixtureList
-    list[#list + 1] = { kind = kind, obj = obj }
+    local entry = { kind = kind, obj = obj }
+    if kind == "item" then
+        entry.id = obj:getID()
+    else
+        obj:getModData().pzlabFixture = true
+        local sq = obj:getSquare()
+        if sq then entry.at = { sq:getX(), sq:getY(), sq:getZ() } end
+    end
+    list[#list + 1] = entry
     PZLab.handle(obj)
     return obj
+end
+
+local itemPlace
+
+-- Records where the items tracked since list index `mark` were placed (see clearFixtures).
+local function notePlaces(mark)
+    local list = PZLab.fixtureList
+    for i = mark + 1, #list do
+        local f = list[i]
+        if f.kind == "item" and not f.at then
+            local place = itemPlace(f.obj)
+            if place and place ~= "character" and place ~= "unloaded" then
+                f.at = { place:getX(), place:getY(), place:getZ() }
+            end
+        end
+    end
 end
 
 local function squareOrError(x, y, z)
@@ -44,7 +90,24 @@ function PZLab.toContainer(target)
     return nil
 end
 
-local function addSpec(container, spec, created)
+local addSpec
+
+-- A new tracked item with its contents (spec) already inside, not yet in any container.
+function PZLab.newItem(fullType, contents)
+    local item = instanceItem(fullType)
+    if not item then error("could not create item '" .. tostring(fullType) .. "'") end
+    track("item", item)
+    if contents then
+        if not instanceof(item, "InventoryContainer") then
+            error(tostring(fullType) .. " is not a container item; it cannot take contents")
+        end
+        addSpec(item:getInventory(), contents, nil, false)
+    end
+    return item
+end
+
+-- sync: send each top-level item to the clients (server only; nested contents travel with it).
+addSpec = function(container, spec, created, sync)
     for _, entry in ipairs(spec) do
         local fullType, count, contents
         if type(entry) == "string" then
@@ -53,15 +116,9 @@ local function addSpec(container, spec, created)
             fullType, count, contents = entry[1] or entry.type, entry[2] or entry.count or 1, entry.contents
         end
         for _ = 1, count do
-            local item = container:AddItem(fullType)
-            if not item then error("could not create item '" .. tostring(fullType) .. "'") end
-            track("item", item)
-            if contents then
-                if not instanceof(item, "InventoryContainer") then
-                    error(tostring(fullType) .. " is not a container item; it cannot take contents")
-                end
-                addSpec(item:getInventory(), contents, nil)
-            end
+            local item = PZLab.newItem(fullType, contents)
+            container:AddItem(item)
+            if sync then syncAdd(container, item) end
             if created then created[#created + 1] = item end
         end
     end
@@ -72,27 +129,29 @@ end
 -- Creates the spec's items in `container` (see PZLab.toContainer for accepted targets).
 -- Returns the created top-level InventoryItems (each has a handle).
 function PZLab.addItems(container, spec)
+    checkSide()
     local c = PZLab.toContainer(container)
     if not c then error("addItems: not a container: " .. tostring(container)) end
-    return addSpec(c, spec or {}, {})
+    local mark = #PZLab.fixtureList
+    local created = addSpec(c, spec or {}, {}, true)
+    notePlaces(mark)
+    return created
 end
 
 -- Puts an item on the floor of a square. opts: offX, offY (0..1 within the tile, default
 -- 0.5), offZ (height, default 0), contents (spec, container items only).
 -- Returns the IsoWorldInventoryObject.
 function PZLab.spawnWorldItem(fullType, x, y, z, opts)
+    checkSide()
     opts = opts or {}
     local sq = squareOrError(x, y, z)
-    local item = sq:AddWorldInventoryItem(fullType, opts.offX or 0.5, opts.offY or 0.5, opts.offZ or 0)
-    if not item then error("could not create item '" .. tostring(fullType) .. "'") end
-    track("item", item)
-    if opts.contents then
-        if not instanceof(item, "InventoryContainer") then
-            error(tostring(fullType) .. " is not a container item; it cannot take contents")
-        end
-        addSpec(item:getInventory(), opts.contents, nil)
-    end
+    local mark = #PZLab.fixtureList
+    local item = PZLab.newItem(fullType, opts.contents)
+    -- on a server AddWorldInventoryItem also sends the item (with its contents) to the clients
+    sq:AddWorldInventoryItem(item, opts.offX or 0.5, opts.offY or 0.5, opts.offZ or 0)
     local worldItem = item:getWorldItem()
+    if not worldItem then error("could not place '" .. tostring(fullType) .. "' on the floor") end
+    notePlaces(mark)
     PZLab.handle(worldItem)
     return worldItem
 end
@@ -102,6 +161,7 @@ end
 -- so the corpse container holds exactly `contents`), contents (spec), blood (splats, default 0).
 -- Returns the IsoDeadBody; its container is body:getContainer() (type inventorymale/female).
 function PZLab.spawnCorpse(x, y, z, opts)
+    checkSide()
     opts = opts or {}
     local sq = squareOrError(x, y, z)
     local body
@@ -125,8 +185,21 @@ function PZLab.spawnCorpse(x, y, z, opts)
         end
         body:invalidateCorpse()
     end
-    if opts.contents then addSpec(container, opts.contents, nil) end
+    local mark = #PZLab.fixtureList
+    if opts.contents then addSpec(container, opts.contents, nil, false) end
+    notePlaces(mark)
+    -- a server sends the finished corpse (with its container) to the clients (sendCorpse)
+    if PZLab.onServer then sendCorpse(body) end
     return body
+end
+
+-- Whether a vehicle really is in the world: its physics transform puts it where its x/y say (a
+-- vehicle vanilla refused to place keeps the transform at 0,0; see spawnVehicle).
+function PZLab.vehiclePlaced(vehicle)
+    if type(vehicle) == "number" then vehicle = PZLab.get(vehicle) end
+    if not vehicle or vehicle:isRemovedFromWorld() or not vehicle:getSquare() then return false end
+    local w = vehicle:getWorldPos(0, 0, 0, Vector3f.new())
+    return math.abs(w:x() - vehicle:getX()) < 2 and math.abs(w:y() - vehicle:getY()) < 2
 end
 
 local DIRECTIONS = { N = "N", NE = "NE", E = "E", SE = "SE", S = "S", SW = "SW", W = "W", NW = "NW" }
@@ -185,6 +258,7 @@ local function removeStrayKeys(vehicle, radius)
                         local items = container:getItems()
                         for k = items:size() - 1, 0, -1 do
                             if isKey(items:get(k)) then
+                                if PZLab.onServer then sendRemoveItemFromContainer(container, items:get(k)) end
                                 container:DoRemoveItem(items:get(k))
                                 removed = removed + 1
                             end
@@ -204,7 +278,13 @@ end
 -- doors and the trunk, see openVehicleDoors), key (put the vehicle's key in the player's
 -- inventory). The key vanilla may drop on the floor or into a container nearby is removed at
 -- once (removeStrayKeys), so clearFixtures leaves the area as it was.
+-- Raises when vanilla doesn't place it: addVehicleDebug checks the spot
+-- (IsoChunk.doSpawnedVehiclesInInvalidPosition: indoors without a vehicle zone, or overlapping
+-- another vehicle) and otherwise still returns a vehicle, which never enters the world (42.21,
+-- verified): its physics transform stays at 0,0 (getAreaCenter and getWorldPos near the map
+-- origin), on a server its id stays -1 and clients never get it. PZLab.vehiclePlaced tells.
 function PZLab.spawnVehicle(scriptName, x, y, z, dir, opts)
+    checkSide()
     opts = opts or {}
     local sq = squareOrError(x, y, z)
     if type(dir) == "string" then
@@ -214,7 +294,12 @@ function PZLab.spawnVehicle(scriptName, x, y, z, dir, opts)
     end
     local vehicle = addVehicleDebug(scriptName or "Base.CarNormal", dir or IsoDirections.E, nil, sq)
     if not vehicle then error("could not spawn vehicle '" .. tostring(scriptName) .. "'") end
+    if not PZLab.vehiclePlaced(vehicle) then
+        error(string.format("vanilla refused to place '%s' at %s,%s,%s (indoors, or overlapping another "
+            .. "vehicle); use open ground", tostring(scriptName or "Base.CarNormal"), x, y, z or 0))
+    end
     track("vehicle", vehicle)
+    local mark = #PZLab.fixtureList
     removeStrayKeys(vehicle, 22)
     for i = 0, vehicle:getPartCount() - 1 do
         local part = vehicle:getPartByIndex(i)
@@ -222,18 +307,47 @@ function PZLab.spawnVehicle(scriptName, x, y, z, dir, opts)
         if container then
             if not opts.loot then container:removeAllItems() end
             local spec = opts.contents and opts.contents[part:getId()]
-            if spec then addSpec(container, spec, nil) end
+            if spec then addSpec(container, spec, nil, true) end
         end
     end
+    notePlaces(mark)
     if opts.open then PZLab.openVehicleDoors(vehicle, true) end
     if opts.key then
         local key = vehicle:createVehicleKey()
-        if key then
-            PZLab.player():getInventory():AddItem(key)
+        local player = PZLab.player(type(opts.key) == "string" and opts.key or nil)
+        if key and player then
+            player:getInventory():AddItem(key)
+            syncAdd(player:getInventory(), key)
             track("item", key)
         end
     end
     return vehicle
+end
+
+-- A world container: a new tile object from a sprite whose properties define a container (default
+-- "carpentry_01_19", the wooden crate players build), on the square's floor. opts: contents
+-- (spec), name (object name). On a server it is sent to the clients with its contents
+-- (transmitCompleteItemToClients, then its contents). Returns the IsoObject (obj:getContainer()).
+function PZLab.spawnContainer(sprite, x, y, z, opts)
+    checkSide()
+    opts = opts or {}
+    sprite = sprite or "carpentry_01_19"
+    local sq = squareOrError(x, y, z)
+    if not getSprite(sprite) then error("unknown sprite '" .. tostring(sprite) .. "'") end
+    local obj = IsoObject.new(sq, sprite, opts.name, false)
+    -- the constructor doesn't make the sprite's container (property "container", e.g. "crate")
+    if not obj:getContainer() then obj:createContainersFromSpriteProperties() end
+    if not obj:getContainer() then error("sprite '" .. sprite .. "' defines no container") end
+    sq:AddTileObject(obj)
+    -- Sent empty, then each item on its own: a container sent with items already inside made the
+    -- client log "Dupe item ID" for them (42.21).
+    if PZLab.onServer then obj:transmitCompleteItemToClients() end
+    track("object", obj)
+    local mark = #PZLab.fixtureList
+    if opts.contents then addSpec(obj:getContainer(), opts.contents, nil, true) end
+    notePlaces(mark)
+    triggerEvent("OnContainerUpdate")
+    return obj
 end
 
 -- The vehicle's part containers: { part, index, type, items, area, world = {x, y} (area
@@ -241,6 +355,7 @@ end
 -- handle (of the ItemContainer) }.
 function PZLab.vehicleContainers(vehicle)
     if type(vehicle) == "number" then vehicle = PZLab.get(vehicle) end
+    if not PZLab.vehiclePlaced(vehicle) then error("the vehicle is not in the world (its area centres would be near 0,0)") end
     local player = PZLab.player()
     local out = {}
     for i = 0, vehicle:getPartCount() - 1 do
@@ -250,13 +365,13 @@ function PZLab.vehicleContainers(vehicle)
             local d = {
                 part = part:getId(), index = i, type = container:getType(),
                 items = container:getItems():size(), area = part:getArea(),
-                accessible = vehicle:canAccessContainer(i, player),
+                accessible = player ~= nil and vehicle:canAccessContainer(i, player),
                 handle = PZLab.handle(container),
             }
             local centre = d.area and vehicle:getAreaCenter(d.area)
             if centre then
                 d.world = { x = centre:getX(), y = centre:getY() }
-                d.center = PZLab.toScreen(centre:getX(), centre:getY(), vehicle:getZ())
+                if PZLab.toScreen then d.center = PZLab.toScreen(centre:getX(), centre:getY(), vehicle:getZ()) end
             end
             out[#out + 1] = d
         end
@@ -284,13 +399,15 @@ local function removeItem(item)
     end
     local container = item:getContainer()
     if container then
-        local player = PZLab.player()
-        if player and (player:isEquipped(item) or player:isAttachedItem(item)) then
-            player:removeAttachedItem(item)
-            player:removeFromHands(item)
-            player:removeWornItem(item, false)
-            triggerEvent("OnClothingUpdated", player)
+        local owner = container:getParent()
+        if owner and instanceof(owner, "IsoGameCharacter")
+                and (owner:isEquipped(item) or owner:isAttachedItem(item)) then
+            owner:removeAttachedItem(item)
+            owner:removeFromHands(item)
+            owner:removeWornItem(item, false)
+            if not PZLab.onServer then triggerEvent("OnClothingUpdated", owner) end
         end
+        if PZLab.onServer then sendRemoveItemFromContainer(container, item) end
         container:DoRemoveItem(item)
         container:setDrawDirty(true)
         found = true
@@ -298,10 +415,21 @@ local function removeItem(item)
     return found
 end
 
+local function removeObject(obj)
+    local sq = obj:getSquare()
+    if not (sq and sq:getObjects():contains(obj)) then return false end
+    sq:transmitRemoveItemFromSquare(obj)
+    if sq:getObjects():contains(obj) then sq:RemoveTileObject(obj) end
+    triggerEvent("OnContainerUpdate")
+    return true
+end
+
 local function removeFixture(f)
     local obj = f.obj
     if f.kind == "item" then
         return removeItem(obj)
+    elseif f.kind == "object" then
+        return removeObject(obj)
     elseif f.kind == "corpse" then
         local sq = obj:getSquare()
         if sq and sq:getStaticMovingObjects():contains(obj) then
@@ -317,27 +445,144 @@ local function removeFixture(f)
     return false
 end
 
+-- Tiles around a connected player within which a server applies (and saves) fixture removals.
+PZLab.SERVER_FIXTURE_REACH = PZLab.SERVER_FIXTURE_REACH or 50
+
+-- A square in the live world, where a removal sticks. Client / single player: in the loaded
+-- chunks around the player. Server (verified 42.21): getGridSquare still returns squares of cells
+-- no player uses any more, but removals made there were lost (the objects came back when a
+-- player returned), so it must also be within SERVER_FIXTURE_REACH tiles of a connected player.
+local function squareLoaded(sq)
+    if sq == nil or PZLab.square(sq:getX(), sq:getY(), sq:getZ()) ~= sq then return false end
+    if not PZLab.onServer then return true end
+    local reach = PZLab.SERVER_FIXTURE_REACH
+    local online = getOnlinePlayers()
+    for i = 0, (online and online:size() or 0) - 1 do
+        local p = online:get(i)
+        if math.abs(p:getX() - sq:getX()) <= reach and math.abs(p:getY() - sq:getY()) <= reach then return true end
+    end
+    return false
+end
+
+-- Where an item is held, for the loaded check: the floor square, the square of what holds its
+-- outermost container, or "character" (an inventory). nil when it is nowhere.
+itemPlace = function(item)
+    local current, guard = item, 0
+    while current and guard < 16 do
+        guard = guard + 1
+        local worldItem = current:getWorldItem()
+        if worldItem then return worldItem:getSquare() or "unloaded" end
+        local c = current:getContainer()
+        if not c then return nil end
+        local bag = c:getContainingItem()
+        if bag then
+            current = bag
+        else
+            local parent = c:getParent()
+            if parent and instanceof(parent, "IsoGameCharacter") then return "character" end
+            if parent then return parent:getSquare() or "unloaded" end
+            local part = c:getVehiclePart()
+            local vehicle = part and part:getVehicle()
+            if vehicle then return vehicle:getSquare() or "unloaded" end
+            return c:getSourceGrid() or "unloaded"
+        end
+    end
+    return nil
+end
+
+-- After its chunk unloaded and loaded again: the world's new object for a fixture, found by
+-- item id (around where it was placed, and in players' inventories) or by modData marker on the
+-- square it was placed on. Returns true when f.obj was replaced.
+local function refresh(f)
+    if f.kind == "item" then
+        local found = f.at and PZLab.findItem(f.id, { near = f.at, radius = 2, zMin = f.at[3], zMax = f.at[3] })
+            or PZLab.findItem(f.id, { radius = 2 })
+        if found and found ~= f.obj then
+            f.obj = found
+            return true
+        end
+        return false
+    end
+    if not f.at then return false end
+    local sq = PZLab.square(f.at[1], f.at[2], f.at[3])
+    if not sq then return false end
+    local candidates = {}
+    if f.kind == "object" then
+        local objects = sq:getObjects()
+        for i = 0, objects:size() - 1 do candidates[#candidates + 1] = objects:get(i) end
+    elseif f.kind == "corpse" then
+        local statics = sq:getStaticMovingObjects()
+        for i = 0, statics:size() - 1 do candidates[#candidates + 1] = statics:get(i) end
+    elseif f.kind == "vehicle" and sq:getVehicleContainer() then
+        candidates[1] = sq:getVehicleContainer()
+    end
+    for _, obj in ipairs(candidates) do
+        if obj ~= f.obj and obj:hasModData() and obj:getModData().pzlabFixture then
+            f.obj = obj
+            return true
+        end
+    end
+    return false
+end
+
+-- The tracked object is in the live world (in a character's inventory counts).
+local function liveNow(f)
+    local obj = f.obj
+    if f.kind == "item" then
+        local place = itemPlace(obj)
+        if place == "character" then return true end
+        return place ~= nil and place ~= "unloaded" and squareLoaded(place)
+    end
+    if f.kind == "vehicle" and obj:isRemovedFromWorld() then return false end
+    local sq = obj:getSquare()
+    return sq ~= nil and squareLoaded(sq)
+end
+
+-- Whether clearFixtures may deal with a fixture now: its object is in the live world (after a
+-- chunk reload: found again, see refresh), or the square it was placed on is live and it is
+-- not there any more (gone: moved away or destroyed; nothing to remove). false: its square is
+-- not live, a removal now would be lost.
+local function reachable(f)
+    if liveNow(f) then return true end
+    if refresh(f) and liveNow(f) then return true end
+    if f.at then
+        local sq = PZLab.square(f.at[1], f.at[2], f.at[3])
+        return sq ~= nil and squareLoaded(sq)
+    end
+    return f.kind == "item" and itemPlace(f.obj) == nil
+end
+
 -- Removes every tracked fixture that still exists (newest first). Returns the number removed.
+-- Fixtures whose square is not loaded (far from the player, or from every connected player on a
+-- server) are left alone and stay listed in PZLab.fixtures(): go near them and clear again.
 function PZLab.clearFixtures()
     local list = PZLab.fixtureList
-    local removed = 0
+    local removed, kept = 0, {}
     for i = #list, 1, -1 do
-        local ok, done = pcall(removeFixture, list[i])
-        if not ok then
-            PZLab.log("clearFixtures: " .. list[i].kind .. ": " .. tostring(done))
-        elseif done then
-            removed = removed + 1
+        local f = list[i]
+        if not reachable(f) then
+            table.insert(kept, 1, f)
+        else
+            local ok, done = pcall(removeFixture, f)
+            if not ok then
+                PZLab.log("clearFixtures: " .. f.kind .. ": " .. tostring(done))
+            elseif done then
+                removed = removed + 1
+            end
         end
         list[i] = nil
     end
+    for i, f in ipairs(kept) do list[i] = f end
+    if #kept > 0 then PZLab.log("clearFixtures: " .. #kept .. " fixture(s) not removed: their squares are not loaded") end
     return removed
 end
 
--- Tracked fixtures still alive: { kind, handle, str }.
+-- Tracked fixtures (not yet cleared): { kind, handle, str, loaded (false: its square is not
+-- loaded now, clearFixtures skips it) }.
 function PZLab.fixtures()
     local out = {}
     for _, f in ipairs(PZLab.fixtureList) do
-        out[#out + 1] = { kind = f.kind, handle = PZLab.handle(f.obj), str = tostring(f.obj) }
+        out[#out + 1] = { kind = f.kind, handle = PZLab.handle(f.obj), str = tostring(f.obj), loaded = reachable(f) }
     end
     return out
 end
@@ -369,11 +614,13 @@ end
 -- Objects around the player: tile objects, floor items, corpses and vehicles.
 -- filter = { radius = 6, zMin = pz, zMax = pz, hasContainer = true|nil, sprite = "lua pattern",
 --            containerType = "crate", class = "IsoDeadBody" (Java class, instanceof), limit = n }
+-- near = {x, y, z} or player = username (server) searches around that point / player instead.
 -- Returns describeObject() tables plus handle, dist (tiles), nearest first.
 function PZLab.findObjects(filter)
     filter = filter or {}
-    local player = PZLab.player()
-    local px, py, pz = player:getX(), player:getY(), math.floor(player:getZ())
+    local px, py, fz = PZLab.searchCentre(filter)
+    if not px then error("findObjects: no player to search around (pass near = {x, y, z})") end
+    local pz = math.floor(fz)
     local cx, cy = math.floor(px), math.floor(py)
     local radius = filter.radius or 6
     local zMin, zMax = filter.zMin or pz, filter.zMax or pz
@@ -420,29 +667,4 @@ function PZLab.findObjects(filter)
         for i = #found, filter.limit + 1, -1 do found[i] = nil end
     end
     return found
-end
-
----------------------------------------------------------------------------------------------
--- Timed actions
----------------------------------------------------------------------------------------------
-
--- True while the player has timed actions queued or running (walk-to, transfers, ...) or is in
--- an action state (climbing, opening windows); the same test vanilla uses plus the Lua queue.
-function PZLab.playerBusy(player)
-    player = player or PZLab.player()
-    if not player then return false end
-    local queue = ISTimedActionQueue.queues[player]
-    if queue and #queue.queue > 0 then return true end
-    return ISTimedActionQueue.isPlayerDoingAction(player) and true or false
-end
-
--- The player's timed-action queue: { busy, queued = { Type, ... } } (first = running).
-function PZLab.actionQueue(player)
-    player = player or PZLab.player()
-    local queue = ISTimedActionQueue.queues[player]
-    local types = {}
-    if queue then
-        for i, action in ipairs(queue.queue) do types[i] = action.Type or tostring(action) end
-    end
-    return { busy = PZLab.playerBusy(player), queued = types }
 end

@@ -136,36 +136,87 @@ local function resolveTarget(target)
     error("gotoLocation: give a location name or {x, y, z}")
 end
 
--- Teleports player 1 to a catalogue location (name) or {x, y, z} and waits until the area is
--- loaded (PZLab.areaLoaded) and the player stands on the target square, then a few frames for
--- the renderer. opts: radius (10), timeoutMs (30000), settleFrames (10). A steps job: return it
--- from the chunk. Result: { name, x, y, z, player = {x, y, z}, ms }.
+-- Within this distance (tiles, x and y) of the target point the player has arrived (multiplayer).
+PZLab.GOTO_ARRIVE = PZLab.GOTO_ARRIVE or 0.25
+
+-- Teleports player 1 to a catalogue location (name) or {x, y, z} (whole numbers: the tile centre;
+-- fractions exact) and waits until the area is loaded (PZLab.areaLoaded) and the player stands on
+-- the target square, then a few frames for the renderer. opts: radius (10), timeoutMs (30000),
+-- settleFrames (10), anywhere (allow a target without map data: PZLab.onMap). A steps job: return
+-- it from the chunk. Result: { name, x, y, z, player = {x, y, z}, ms[, sent] }.
+--
+-- Multiplayer (isClient()): only the server moves the player, as when vanilla admins teleport:
+-- `/teleportto x,y,z` with the exact point (the command takes fractions; needs an admin account).
+-- The server sends the client a Teleport packet, the client takes the position and reports it.
+-- Nothing is sent when the player already stands at the point (sent = false). Arrived = the
+-- client stands within GOTO_ARRIVE of the point (42.21, verified): whole-number coordinates would
+-- put the player on the tile's corner, where collision pushes them onto a neighbouring tile; a
+-- position the client sets itself is checked by the server's no-clip anti-cheat against its last
+-- known position (500 ms after a server teleport) and, across a wall, snapped back; a client-side
+-- teleportTo leaves the client drawing only a patch of the map. lab.goto then also waits until
+-- the lab server has the player at the same spot.
 function PZLab.gotoLocation(target, opts)
     opts = opts or {}
     local x, y, z, name = resolveTarget(target)
+    if type(x) ~= "number" or type(y) ~= "number" then error("gotoLocation: bad target " .. tostring(target)) end
     local radius = opts.radius or 10
-    local started
+    local fx = (x == math.floor(x)) and x + 0.5 or x
+    local fy = (y == math.floor(y)) and y + 0.5 or y
+    if not opts.anywhere and not PZLab.onMap(fx, fy) then
+        error(string.format("gotoLocation: %.2f,%.2f is not on the map (no map data there); "
+            .. "opts.anywhere = true to go anyway", fx, fy))
+    end
+    local mp = isClient()
+    local started, sent = nil, false
+    local function where()
+        local p = PZLab.player()
+        return string.format("%.3f,%.3f,%.1f", p:getX(), p:getY(), p:getZ())
+    end
     local function onTarget()
         local sq = PZLab.player():getCurrentSquare()
         return sq ~= nil and sq:getX() == math.floor(x) and sq:getY() == math.floor(y) and sq:getZ() == math.floor(z)
     end
+    local function atPoint()
+        local p = PZLab.player()
+        local d = PZLab.GOTO_ARRIVE
+        return math.abs(p:getX() - fx) <= d and math.abs(p:getY() - fy) <= d and math.floor(p:getZ()) == math.floor(z)
+    end
     return PZLab.steps({
         function()
             started = getTimestampMs()
-            PZLab.teleport(x, y, z)
+            if mp then
+                if not atPoint() then
+                    SendCommandToServer(string.format("/teleportto %.3f,%.3f,%d", fx, fy, math.floor(z)))
+                    sent = true
+                end
+            else
+                PZLab.teleport(x, y, z)
+            end
         end,
-        PZLab.waitUntil(function() return PZLab.areaLoaded(x, y, z, radius) end, opts.timeoutMs or 30000),
+        PZLab.waitUntil(function() return (not mp or atPoint()) and PZLab.areaLoaded(x, y, z, radius) end,
+            opts.timeoutMs or 30000, function()
+                if mp and not atPoint() then
+                    return string.format("the player is at %s, not at %.3f,%.3f,%d (teleport refused, e.g. "
+                        .. "not an admin account, or the player was pushed away)", where(), fx, fy, math.floor(z))
+                end
+                return "the area within " .. radius .. " tiles of the target did not load"
+            end),
         function()
-            -- placed again once the squares exist: on an upper floor the first placement can
-            -- drop the player before the floor has loaded
-            if not onTarget() then PZLab.teleport(x, y, z) end
+            -- single player: placed again once the squares exist: on an upper floor the first
+            -- placement can drop the player before the floor has loaded
+            if not mp and not onTarget() then PZLab.teleport(x, y, z) end
         end,
         opts.settleFrames or 10,
-        PZLab.waitUntil(onTarget, 5000),
+        PZLab.waitUntil(onTarget, 5000, function()
+            return "the player is at " .. where() .. ", not on tile " .. math.floor(x) .. "," .. math.floor(y)
+                .. "," .. math.floor(z) .. " (pushed off it: a wall, furniture or vehicle there?)"
+        end),
         function()
             local p = PZLab.player()
-            return { name = name, x = x, y = y, z = z, player = { x = p:getX(), y = p:getY(), z = p:getZ() },
-                     ms = getTimestampMs() - started }
+            local result = { name = name, x = x, y = y, z = z, player = { x = p:getX(), y = p:getY(), z = p:getZ() },
+                             ms = getTimestampMs() - started }
+            if mp then result.sent = sent end
+            return result
         end,
     })
 end

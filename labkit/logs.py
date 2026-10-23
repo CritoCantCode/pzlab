@@ -1,6 +1,7 @@
 """Reading the lab's console.txt: marks (byte offsets) and error extraction."""
 
 import re
+from pathlib import Path
 
 ERROR_LINE = re.compile(r"^(ERROR|SEVERE)\b|STACK TRACE|Exception|attempted index|\[PZLab\] ERROR|Lua fail")
 # ExceptionLogger's block header, e.g. "ERROR: General      f:3510> Lua(Vanilla).onTick> Exception thrown"
@@ -21,13 +22,22 @@ NOISE = (
     "CraftRecipeComponentScript",
     "refusing to list",
     "Missing tile definition",  # map data referencing *_TEST_* tiles, logged as areas load (42.21)
+    # multiplayer: loading the server's mods, the animator walks every mod's media/AnimSets and
+    # media/actiongroups and logs a NoSuchFileException for each folder a mod lacks (42.21)
+    "AdvancedAnimator$1.visitFileFailed",
+    "AnimSets at WindowsException",
+    "actiongroups at WindowsException",
 )
 
 
 class Log:
-    def __init__(self, cfg):
-        self.path = cfg.console_log
-        self.mark_file = cfg.profile_dir / "pzlab.logmark"
+    """A game log file (the client's console.txt by default) read from a mark (byte offset).
+    Log(cfg) = the lab client's console.txt; Log(path=..., mark_file=...) any other log (the lab
+    server's, see labkit/server.py)."""
+
+    def __init__(self, cfg=None, path=None, mark_file=None):
+        self.path = Path(path) if path else cfg.console_log
+        self.mark_file = Path(mark_file) if mark_file else cfg.profile_dir / "pzlab.logmark"
 
     def size(self):
         try:

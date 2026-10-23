@@ -46,7 +46,8 @@ end
 --   function(ctx)       called; its return value becomes ctx.last (the job's result at the end)
 --   number n            wait n frames
 --   PZLab.waitMs(ms)    wait ms milliseconds
---   PZLab.waitUntil(fn, timeoutMs)  wait until fn(ctx) is truthy (error on timeout)
+--   PZLab.waitUntil(fn, timeoutMs, describe)  wait until fn(ctx) is truthy (error on timeout;
+--                       describe(ctx), if given, says why in the error message)
 -- ctx is a table shared by all entries.
 function PZLab.steps(list)
     return { __pzlabSteps = true, list = list }
@@ -56,8 +57,8 @@ function PZLab.waitMs(ms)
     return { ms = ms }
 end
 
-function PZLab.waitUntil(fn, timeoutMs)
-    return { untilFn = fn, timeout = timeoutMs or 5000 }
+function PZLab.waitUntil(fn, timeoutMs, describe)
+    return { untilFn = fn, timeout = timeoutMs or 5000, describe = describe }
 end
 
 -- Appends a line to the running command's "out" list (or the log outside a command).
@@ -139,7 +140,12 @@ local function step(c)
         end
         if not done then
             if now > c.untilDeadline then
-                finish(c, false, nil, "step " .. c.index .. ": waitUntil timed out")
+                local why = ""
+                if entry.describe then
+                    local okWhy, text = run(c, entry.describe, c.ctx)
+                    why = ": " .. tostring(okWhy and text or ("(describe failed: " .. tostring(text) .. ")"))
+                end
+                finish(c, false, nil, "step " .. c.index .. ": waitUntil timed out" .. why)
             end
             return
         end
@@ -222,7 +228,7 @@ local function poll()
     end
 end
 
-local function heartbeat()
+local function clientHeartbeat()
     local player = getSpecificPlayer(0)
     local state = {
         v = PZLab.VERSION,
@@ -234,6 +240,10 @@ local function heartbeat()
         mouse = { getMouseX(), getMouseY() },
         screen = { getCore():getScreenWidth(), getCore():getScreenHeight() },
     }
+    -- isClient(): connected (or connecting) to a server. Not getOnlineUsername(): it throws (NPE,
+    -- logged even under pcall) until the player exists.
+    if isClient() then state.mp = true end
+    if PZLab.connectState then state.connect = PZLab.connectState end
     if player then
         state.player = { x = player:getX(), y = player:getY(), z = player:getZ(), dead = player:isDead() }
         local okSpeed, speed = pcall(getGameSpeed)
@@ -243,7 +253,32 @@ local function heartbeat()
             if okMenu then state.pauseMenu = open end
         end
     end
-    PZLab.writeFile("state.json", PZLab.json(state))
+    return state
+end
+
+-- Dedicated server: state "server", the connected players.
+local function serverHeartbeat()
+    local players = {}
+    local online = getOnlinePlayers()
+    for i = 0, (online and online:size() or 0) - 1 do
+        local p = online:get(i)
+        players[#players + 1] = { user = p:getUsername(), x = p:getX(), y = p:getY(), z = p:getZ(),
+                                  dead = p:isDead() }
+    end
+    return {
+        v = PZLab.VERSION,
+        t = getTimestampMs(),
+        ticks = Bridge.ticks,
+        state = "server",
+        seq = Bridge.lastSeq,
+        busy = Bridge.current ~= nil,
+        players = players,
+        tickEvent = Bridge.tickEvent,
+    }
+end
+
+local function heartbeat()
+    PZLab.writeFile("state.json", PZLab.json(PZLab.onServer and serverHeartbeat() or clientHeartbeat()))
 end
 
 -- One tick per frame: from OnFETick at the menu, OnTickEvenPaused in game.
@@ -287,11 +322,17 @@ local function bind(eventName, fn)
     Events[eventName].Add(fn)
 end
 
-bind("OnFETick", function()
-    if not getSpecificPlayer(0) then PZLab.tick() end
-end)
-bind("OnTickEvenPaused", function()
-    if getSpecificPlayer(0) then PZLab.tick() end
-end)
+if PZLab.onServer then
+    -- A dedicated server runs IngameState.update every loop, players or not.
+    Bridge.tickEvent = PZLab.SERVER_TICK_EVENT or "OnTickEvenPaused"
+    bind(Bridge.tickEvent, function() PZLab.tick() end)
+else
+    bind("OnFETick", function()
+        if not getSpecificPlayer(0) then PZLab.tick() end
+    end)
+    bind("OnTickEvenPaused", function()
+        if getSpecificPlayer(0) then PZLab.tick() end
+    end)
+end
 
-PZLab.log("bridge ready (v" .. PZLab.VERSION .. ")")
+PZLab.log("bridge ready (v" .. PZLab.VERSION .. (PZLab.onServer and ", server" or "") .. ")")

@@ -4,9 +4,13 @@
   doctor                           environment report
   check PATH...                    Lua syntax check with the game's own compiler (no launch)
   setup [--mod NAME]... [--mod-dir PATH]...   prepare the profile without launching
-  start [--mod NAME]... [--mod-dir PATH]... [--menu] [--no-wait] [--at X Y Z | --at LOCATION]
+  start [--mod NAME]... [--mod-dir PATH]... [--menu | --join] [--no-wait] [--at X Y Z | --at LOCATION]
   world [--at X Y Z | --at LOCATION]   launch a fresh world from the main menu of a running game
-  stop [--force] | status
+  stop [--force] [--all] | status
+  join [--user U --password P] [--ip IP --port N]   join a server (default: the lab server) from the menu
+  server start [--mod NAME]... [--mod-dir PATH]... [--at ...] [--keep-world] [--no-wait]
+  server stop [--force] | status | lua CODE | lua -f FILE | cmd TEXT | user NAME PASSWORD [--access A]
+  server log [--errors | --exceptions] [--all] [--tail N] [--grep RE] | mark | wait EXPR
   lua CODE | lua -f FILE [--timeout MS]    (single expressions are auto-returned)
   shot [--out PATH] [--crop X Y W H] [--scale F] [--check]
   ui [--menus]                     UI state: pause menu, context menus, modals, speed, focus, problems
@@ -63,6 +67,47 @@ def at_position(values):
         raise ValueError("--at takes X Y Z or a location name, got %s" % " ".join(values))
 
 
+def print_log(log, args):
+    since = 0 if args.all else None
+    if args.exceptions:
+        found = log.exceptions(since)
+        if args.grep:
+            found = [e for e in found if re.search(args.grep, json.dumps(e))]
+        emit(found[-args.tail:] if args.tail else found)
+        return
+    lines = log.errors(since, args.noise) if args.errors else log.lines(since)
+    if args.grep:
+        lines = [ln for ln in lines if re.search(args.grep, ln)]
+    if args.tail:
+        lines = lines[-args.tail:]
+    print("\n".join(lines))
+
+
+def server_command(lab, args):
+    server = lab.server
+    if args.action == "start":
+        emit(server.start(args.mod, args.mod_dir, world=at_position(args.at), fresh=not args.keep_world,
+                          wait=not args.no_wait, timeout_s=args.timeout))
+    elif args.action == "stop":
+        emit(server.stop(force=args.force))
+    elif args.action == "status":
+        emit(server.status())
+    elif args.action == "lua":
+        code = Path(args.file).read_text(encoding="utf-8") if args.file else as_chunk(args.code)
+        emit(server.bridge.exec(code, args.timeout))
+    elif args.action == "cmd":
+        emit({"output": server.command(" ".join(args.text), timeout_s=args.timeout)})
+    elif args.action == "user":
+        emit({"output": server.ensure_user(args.name, args.password, args.access)})
+    elif args.action == "log":
+        print_log(server.log, args)
+    elif args.action == "mark":
+        emit({"offset": server.log.mark()})
+    elif args.action == "wait":
+        emit({"value": server.wait_until(args.expr, args.timeout, args.poll)})
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="pzlab", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -83,7 +128,12 @@ def main(argv=None):
         p.add_argument("--mod-dir", action="append",
                        help="path to a mod folder or Workshop item to link and enable (repeatable)")
         if name == "start":
-            p.add_argument("--menu", action="store_true", help="stop at the main menu (no world)")
+            mode = p.add_mutually_exclusive_group()
+            mode.add_argument("--menu", action="store_true", help="stop at the main menu (no world)")
+            mode.add_argument("--join", action="store_true",
+                              help="multiplayer: start the lab server if needed (same mods), join it")
+            p.add_argument("--user", help="--join: account to join with (default: the lab server's admin)")
+            p.add_argument("--password", help="--join: its password")
             p.add_argument("--no-wait", action="store_true")
             p.add_argument("--at", nargs="+", metavar="X Y Z | LOCATION",
                            help="spawn tile, or a name from labkit/locations.json")
@@ -94,7 +144,53 @@ def main(argv=None):
     p.add_argument("--timeout", type=int, default=300)
     p = sub.add_parser("stop")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--all", action="store_true", help="also stop the lab server")
     sub.add_parser("status")
+    p = sub.add_parser("join", help="join a multiplayer server from the main menu (default: the lab server)")
+    p.add_argument("--user")
+    p.add_argument("--password")
+    p.add_argument("--server-password", default="")
+    p.add_argument("--ip")
+    p.add_argument("--port", type=int)
+    p.add_argument("--timeout", type=int, default=300)
+    p.add_argument("--keep-chat", action="store_true", help="leave the chat window open")
+    p.add_argument("--keep-weather", action="store_true", help="don't override fog/precipitation")
+
+    p = sub.add_parser("server", help="the lab server: a dedicated server for multiplayer tests")
+    ssub = p.add_subparsers(dest="action", required=True)
+    q = ssub.add_parser("start")
+    q.add_argument("--mod", action="append", help="mod folder name / ID to enable (repeatable)")
+    q.add_argument("--mod-dir", action="append", help="mod folder or Workshop item to link and enable")
+    q.add_argument("--at", nargs="+", metavar="X Y Z | LOCATION", help="where new characters spawn")
+    q.add_argument("--keep-world", action="store_true", help="keep the previous world and accounts")
+    q.add_argument("--no-wait", action="store_true")
+    q.add_argument("--timeout", type=int, default=300)
+    q = ssub.add_parser("stop")
+    q.add_argument("--force", action="store_true")
+    ssub.add_parser("status")
+    q = ssub.add_parser("lua")
+    q.add_argument("code", nargs="?")
+    q.add_argument("-f", "--file")
+    q.add_argument("--timeout", type=int, default=10000)
+    q = ssub.add_parser("cmd", help="server console command, e.g. players, save, help")
+    q.add_argument("text", nargs="+")
+    q.add_argument("--timeout", type=float, default=10)
+    q = ssub.add_parser("user", help="create an account (if missing) and set its access level")
+    q.add_argument("name")
+    q.add_argument("password")
+    q.add_argument("--access", default="admin")
+    q = ssub.add_parser("log")
+    q.add_argument("--errors", action="store_true")
+    q.add_argument("--exceptions", action="store_true")
+    q.add_argument("--all", action="store_true")
+    q.add_argument("--tail", type=int)
+    q.add_argument("--grep")
+    q.add_argument("--noise", action="store_true")
+    ssub.add_parser("mark")
+    q = ssub.add_parser("wait")
+    q.add_argument("expr")
+    q.add_argument("--timeout", type=float, default=10)
+    q.add_argument("--poll", type=float, default=0.1)
 
     p = sub.add_parser("lua")
     p.add_argument("code", nargs="?")
@@ -136,6 +232,7 @@ def main(argv=None):
     p.add_argument("target", nargs="+", metavar="NAME | X Y [Z]")
     p.add_argument("--radius", type=int, default=10, help="tiles around the target that must be loaded")
     p.add_argument("--timeout", type=int, default=30)
+    p.add_argument("--anywhere", action="store_true", help="allow a target off the map (no map data)")
     sub.add_parser("locations", help="list the test-location catalogue")
     p = sub.add_parser("panes", help="show, expand and pin the vanilla inventory and loot windows")
     p.add_argument("--no-pin", action="store_true")
@@ -210,15 +307,26 @@ def main(argv=None):
             emit(lab.setup(args.mod, args.mod_dir))
         elif args.cmd == "start":
             world = at_position(args.at)
+            join = args.join
+            if join and args.user:
+                join = {"user": args.user, "password": args.password}
             emit(lab.start(args.mod, world=world, autostart=not args.menu, wait=not args.no_wait,
-                           timeout_s=args.timeout, mod_dirs=args.mod_dir))
+                           timeout_s=args.timeout, mod_dirs=args.mod_dir, join=join))
         elif args.cmd == "world":
             world = at_position(args.at)
             emit(lab.launch_world(world, wait=not args.no_wait, timeout_s=args.timeout))
         elif args.cmd == "stop":
-            emit(lab.stop(force=args.force))
+            result = lab.stop(force=args.force)
+            if args.all:
+                result = {"client": result, "server": lab.server.stop(force=args.force)}
+            emit(result)
         elif args.cmd == "status":
             emit(lab.status())
+        elif args.cmd == "join":
+            emit(lab.join(args.user, args.password, args.server_password, args.ip, args.port, args.timeout,
+                          close_chat=not args.keep_chat, clear_weather=not args.keep_weather))
+        elif args.cmd == "server":
+            return server_command(lab, args)
         elif args.cmd == "lua":
             code = Path(args.file).read_text(encoding="utf-8") if args.file else as_chunk(args.code)
             emit(lab.bridge.exec(code, args.timeout))
@@ -255,7 +363,7 @@ def main(argv=None):
                 emit({"zoom": lab.get_zoom(), "levels": lab.zoom_levels()})
         elif args.cmd == "goto":
             target = args.target[0] if len(args.target) == 1 else [float(v) for v in args.target]
-            emit(lab.goto(target, radius=args.radius, timeout_s=args.timeout))
+            emit(lab.goto(target, radius=args.radius, timeout_s=args.timeout, anywhere=args.anywhere))
         elif args.cmd == "locations":
             emit(lab.locations())
         elif args.cmd == "panes":
@@ -291,19 +399,7 @@ def main(argv=None):
             lab.input.type_text(args.text)
             emit({"ok": True})
         elif args.cmd == "log":
-            since = 0 if args.all else None
-            if args.exceptions:
-                found = lab.log.exceptions(since)
-                if args.grep:
-                    found = [e for e in found if re.search(args.grep, json.dumps(e))]
-                emit(found[-args.tail:] if args.tail else found)
-                return 0
-            lines = lab.log.errors(since, args.noise) if args.errors else lab.log.lines(since)
-            if args.grep:
-                lines = [ln for ln in lines if re.search(args.grep, ln)]
-            if args.tail:
-                lines = lines[-args.tail:]
-            print("\n".join(lines))
+            print_log(lab.log, args)
         elif args.cmd == "mark":
             emit({"offset": lab.log.mark()})
         elif args.cmd == "window":

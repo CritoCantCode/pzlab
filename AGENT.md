@@ -2,8 +2,10 @@
 
 Drives a real Project Zomboid (Build 42) instance for automated testing of any mod: launch into a
 world unattended, run Lua inside the live game, inject mouse/keyboard, take screenshots, read
-logs. Built for Claude; terse by design. Self-contained: everything is in this repository, nothing
-names a machine, user or mod; the folder can be copied anywhere.
+logs. Single player, or multiplayer: a local dedicated server (the lab server) with one or more
+lab clients joined to it, Lua on both sides (see Multiplayer). Built for Claude; terse by design.
+Self-contained: everything is in this repository, nothing names a machine, user or mod; the
+folder can be copied anywhere.
 
 ## Requirements
 
@@ -29,9 +31,16 @@ All commands: `python pzlab.py <cmd>`. Output is JSON.
 |---|---|
 | `init [--game-dir D] [--no-import]`, `doctor` | machine setup / environment report |
 | `check PATH...` | Lua syntax check with the game's own Kahlua compiler; no game launch |
-| `start [--mod-dir PATH]... [--mod NAME]... [--at X Y Z \| --at LOCATION] [--menu]` | setup + launch + autostart world + dismiss "Click to Start"; ~40 s cold. `--mod-dir` links any mod folder or Workshop item (`Contents/mods/<one mod>`); `--mod` names one from config. `--at` takes a tile or a catalogue name (see Test locations). `--menu` stops at main menu. |
+| `start [--mod-dir PATH]... [--mod NAME]... [--at X Y Z \| --at LOCATION] [--menu \| --join [--user U --password P]]` | setup + launch + autostart world + dismiss "Click to Start"; ~40 s cold. `--mod-dir` links any mod folder or Workshop item (`Contents/mods/<one mod>`); `--mod` names one from config. `--at` takes a tile or a catalogue name (see Test locations). `--menu` stops at main menu. `--join`: multiplayer instead: starts the lab server if it isn't running (same mods, `--at` = spawn point), launches to the menu and joins it (`join`); ~95 s cold (server ~45 s, join ~35-50 s) |
 | `world [--at X Y Z \| --at LOCATION]` | from main menu of a running game, launch a fresh world (~25 s) |
-| `stop [--force]` | graceful `quitToDesktop`, kill after 20 s |
+| `stop [--force] [--all]` | graceful `quitToDesktop`, kill after 20 s; `--all` also stops the lab server |
+| `join [--user U --password P] [--ip IP --port N] [--keep-chat] [--keep-weather]` | from the main menu of a running client: join a server (default: the lab server, as its admin), drive character creation on a first join, wait until in the world (Multiplayer) |
+| `server start [--mod-dir PATH]... [--mod NAME]... [--at X Y Z \| LOCATION] [--keep-world] [--no-wait]` | start the lab server (dedicated, loopback, own profile; `--at` = where new characters spawn); a fresh world unless `--keep-world`; ~45 s cold |
+| `server stop [--force]`, `server status` | `quit` on its console (saves, exits), kill after 60 s / pid, address, heartbeat (`players`) |
+| `server lua CODE` / `server lua -f FILE [--timeout MS]` | run Lua in the server's Lua state (the authoritative world) |
+| `server cmd TEXT...` | server console command (`players`, `save`, `help`, `additem "user" Base.Axe`, ...) → its output lines |
+| `server user NAME PASSWORD [--access admin]` | create the account if missing, set its access level |
+| `server log [--errors \| --exceptions] [--all] [--tail N] [--grep RE]`, `server mark`, `server wait EXPR` | as `log`/`mark`/`wait`, for the server (its log is `<server profile>/stdout.log`) |
 | `status` | pid, window, harness heartbeat (`state` menu/ingame, `age_s`, ticks, player) |
 | `lua CODE` / `lua -f FILE [--timeout MS]` | run Lua in game; single expressions auto-`return`ed |
 | `shot [--crop X Y W H] [--scale F] [--out P] [--check]` | in-game screenshot (frame buffer, UI included) → path; Read it to view. `--check` adds `problems` (uiState at the capture, e.g. `["pauseMenu", "paused"]`) |
@@ -39,7 +48,7 @@ All commands: `python pzlab.py <cmd>`. Output is JSON.
 | `move X Y`, `click X Y [--button right] [--double] [--mod KEY]...`, `drag X1 Y1 X2 Y2 [--mod KEY]...`, `wheel X Y N` | mouse; `--mod alt` (shift, ctrl, ...; repeatable) holds keys around the click/drag |
 | `hover OBJ [--allow-ui]` | mouse onto a world object (Lua expression or handle id) until the engine picks it → `{point (or null), candidates, tried, covered}`; points where UI blocks the world pick (`PZLab.pickBlockedBy`: click-through UI too) are skipped and listed in `covered` |
 | `zoom [Z]` | camera zoom and the supported levels; with Z: snap to the nearest level, wait until settled → `{zoom, levels}` |
-| `goto NAME` / `goto X Y [Z] [--radius R]` | teleport to a catalogue location or tile, wait until the area is loaded → `{name, x, y, z, player, ms}` |
+| `goto NAME` / `goto X Y [Z] [--radius R] [--anywhere]` | teleport to a catalogue location or tile (whole numbers: its centre), wait until the area is loaded → `{name, x, y, z, player, ms}`; multiplayer also `sent`, `server` (`lab.goto`). Off-map targets are refused unless `--anywhere` |
 | `locations` | the test-location catalogue (`labkit/locations.json`) |
 | `panes [--no-pin]` | `PZLab.showInventoryPanes`: vanilla inventory + loot windows visible, expanded, pinned → handles and pane info |
 | `layout save` / `layout restore ID [--hide-added]` | snapshot the top-level UI windows → `{id, windows}` / put them back (`PZLab.restoreLayout`) |
@@ -51,7 +60,7 @@ All commands: `python pzlab.py <cmd>`. Output is JSON.
 | `load-lua NAME (SRC \| --code CODE) [--hot \| --boot]`, `load-lua --clear` | run Lua source as the file NAME through the engine's file loader (`lab.load_lua`); `--clear` deletes those files |
 | `ui [--menus]` | UI state (`PZLab.uiState()`): pause menu, context menus, modal dialogs, speed, mouse-over UI (what a click hits; what blocks the world pick), text focus, drag, what Escape would do, `problems`/`playable`; `--menus` adds the open context menus with each option's click point |
 | `playable [--speed N]` | `PZLab.ensurePlayable`: leave the pause menu (vanilla Resume path), close context menus, unfocus a text entry, set speed (0-4, default 1) → `{before, after, closed}`. Reports modal dialogs, never answers them |
-| `run SCRIPT.py` | Python test script with `lab` (labkit.Lab) predefined; see the probes in scripts/: `probe_aim` (hover every container nearby; a click-through panel over one, without and with a consuming / click-through child: clicks vs picking), `probe_fixtures`, `probe_ui_state`, `probe_camera` (zoom levels × pickers × hover, UI-covered hover), `probe_layout` (snapshot/restore, inventory panes), `probe_locations` (re-verify the catalogue), `probe_engine` (re-verify the Lua engine facts: hot reload and events, Kahlua library, pcall'd errors, UI queues, timers) |
+| `run SCRIPT.py` | Python test script with `lab` (labkit.Lab) predefined; see the probes in scripts/: `probe_aim` (hover every container nearby; a click-through panel over one, without and with a consuming / click-through child: clicks vs picking), `probe_fixtures`, `probe_ui_state`, `probe_camera` (zoom levels × pickers × hover, UI-covered hover), `probe_layout` (snapshot/restore, inventory panes), `probe_locations` (re-verify the catalogue), `probe_engine` (re-verify the Lua engine facts: hot reload and events, Kahlua library, pcall'd errors, UI queues, timers), `probe_mp` (multiplayer: lab server + client; checks: goto to the player's own tile, beside a server-spawned vehicle, refusals of an indoor vehicle spot and an off-map target, then an inventory transfer; findings: a crate with a bag next to the player made on the server, vanilla transfers out of / into the bag and the crate, where the server says each item went and how the client's actions finished; starts and stops what isn't running) |
 
 Python API (`from labkit import Lab`): `lab.start/stop/status/launch_world/wait_state`,
 `lab.lua(code)` (raises LuaError), `lab.bridge.exec(code)` (raw result), `lab.input.move/click/
@@ -75,10 +84,14 @@ drag/wheel/tap/chord/type_text/press_modifiers/release_modifiers`, `lab.screensh
 | `lab.require_playable(allow=())` | raises `labkit.NotPlayable` (`.problems`, `.state`) unless every uiState problem is in `allow` (exact, or a prefix such as `"modal"`); returns the state. Call before acting so a stray pause menu or dialog can't silently void a test |
 | `lab.screenshot(..., check=True)` | → `{path, problems}` instead of the path |
 | `lab.set_zoom(z)`, `lab.get_zoom()`, `lab.zoom_levels()` | `PZLab.setZoom/getZoom/zoomLevels`: set_zoom snaps to the nearest level and returns the zoom once settled |
-| `lab.goto(name_or_xyz, radius=10, timeout_s=30)` | `PZLab.gotoLocation`: teleport to a catalogue name or `(x, y[, z])`, wait until loaded → `{name, x, y, z, player, ms}` |
+| `lab.goto(name_or_xyz, radius=10, timeout_s=30, anywhere=False)` | `PZLab.gotoLocation`: teleport to a catalogue name or `(x, y[, z])`, wait until loaded → `{name, x, y, z, player, ms}`. Multiplayer: `sent` (false: already standing at the point, nothing sent) and, on the lab server, `server` = the server's position of this player, waited for until it matches the client's (TimeoutError otherwise) |
 | `lab.locations()` | the catalogue: name → entry (see Test locations) |
 | `lab.show_inventory_panes(player=0, pin=True, inventory=None, loot=None)` | `PZLab.showInventoryPanes`, then waits until both panes show their list → `{inventory: {window, pane, rect, info}, loot: {...}}` (`info` = `paneInfo`); `inventory`/`loot` = `{x, y, w, h}` places the window |
 | `with lab.ui_layout(hide_added=False) as snap:` | snapshot the UI layout, restore it when the block ends (also on errors). Also `lab.save_layout()` → snapshot, `lab.restore_layout(snap_or_id, hide_added=False)` → `{restored, changed, added, missing}` |
+| `lab.start(..., join=True)` | multiplayer: lab server started if not running (same `enable`/`mod_dirs`/`world`), client to the menu, `lab.join()`; `join={"user": U, "password": P}` joins with that account → result plus `server` (when started) and `join` |
+| `lab.join(user=None, password=None, server_password="", ip=None, port=None, timeout_s=300, close_chat=True, clear_weather=True)` | join from the main menu (default: the lab server as its admin) and wait until in the world → `{user, ip, port, created (character creation driven), pressed (screens), events (timed join log), ms, state}`; raises RuntimeError with vanilla's reason + events on failure. Then applies `world.closeUI`, closes the chat window (`close_chat`) and clears fog/rain (`clear_weather`, `PZLab.clearWeather`) |
+| `lab.server` | the lab server (`labkit.server.Server`): `start(enable=None, mod_dirs=None, world=None, fresh=None, wait=True, timeout_s=300)` → `{profile, active_mods, world, address, pid, archived, pruned, ready_s, state}`, `stop(force=False, timeout_s=60)`, `status()`, `pid()`, `lua(code)` (raises LuaError), `bridge.exec(code)`, `wait_until(expr)`, `command(text, timeout_s=10)` → output lines, `ensure_user(name, password, access="admin")`, `players()`, `clear_fixtures()`, `log` (a `Log`: `mark/lines/errors/exceptions/size`), `setup(...)` (files only) |
+| `lab.client(profile)` | another lab client with its own profile folder (e.g. `"profile-2"`) for this lab's server → a `Lab`; `Lab(profile=..., server_profile=...)` sets both folders explicitly (CLI: env `PZLAB_PROFILE` / `PZLAB_SERVER_PROFILE`) |
 
 Start every test from a known state: `lab.ensure_playable()` (then `lab.require_playable()` before
 steps that need world input). Close menus with `lab.close_context_menus()`, never with `key esc`.
@@ -91,33 +104,69 @@ next to the player → `with lab.ui_layout():` `panes = lab.show_inventory_panes
 `lab.wait_until("not PZLab.playerBusy()")` → assert where the item is (`PZLab.get(h):getContainer()`)
 → `lab.clear_fixtures()`.
 
+Typical multiplayer test (`scripts/probe_mp.py` does all of it):
+
+```python
+lab.start(mod_dirs=[MOD], join=True)              # lab server (fresh world) + client joined as admin
+user = lab.lua("return getSpecificPlayer(0):getUsername()")
+lab.server.lua('PZLab.usePlayer("%s") return true' % user)
+ids = lab.server.lua("""local p = PZLab.player()        -- fixtures on the server: sent to the clients
+    local crate = PZLab.spawnContainer(nil, math.floor(p:getX()) + 1, math.floor(p:getY()), 0,
+        { contents = { { "Base.Bag_Schoolbag", 1, contents = { "Base.Apple" } } } })
+    local bag = crate:getContainer():getItems():get(0)
+    return { bag = bag:getID(), apple = bag:getInventory():getItems():get(0):getID() }""")
+lab.wait_until("PZLab.findItem(%d, { radius = 3 }) ~= nil" % ids["apple"])   # same ids on clients
+lab.lua("PZLab.traceActions({ 'ISInventoryTransferAction' }) return true")
+lab.lua("""local p = getSpecificPlayer(0)              -- the client acts through vanilla timed actions
+    ISTimedActionQueue.add(ISInventoryTransferAction:new(p, PZLab.findItem(%d, { radius = 3 }),
+        PZLab.findItem(%d, { radius = 3 }):getInventory(), p:getInventory()))""" % (ids["apple"], ids["bag"]))
+lab.wait_until("not PZLab.playerBusy()", timeout_s=40)
+print(lab.server.lua("return PZLab.placeText(PZLab.locate(%d))" % ids["apple"]))  # server truth
+print(lab.lua("return PZLab.actionTrace()"))       # how the client's action went
+lab.server.clear_fixtures(); lab.stop(); lab.server.stop()
+```
+
 Coordinates everywhere are game UI pixels = window client pixels (1280×720 by default).
 
 ## Layout
 
-- Config layers (later wins): built-in defaults (`labkit/config.py`) → `lab.json` (portable, committed: resolution, world, game args) → `lab.local.json` (this machine, gitignored: game_dir, options_overrides) → env `PZLAB_GAME_DIR`, `PZLAB_PROFILE` (profile dir, relative to the repo root) → CLI. Keys: `mods` (`name: path`), `enabled`, `world` (map, x, y, z, sandbox, god, closeUI, onStart), `heap` (null = game's own), `keep_saves`, `window`.
+- Config layers (later wins): built-in defaults (`labkit/config.py`) → `lab.json` (portable, committed: resolution, world, game args) → `lab.local.json` (this machine, gitignored: game_dir, options_overrides) → env `PZLAB_GAME_DIR`, `PZLAB_PROFILE` (profile dir, relative to the repo root), `PZLAB_SERVER_PROFILE` → CLI. Keys: `mods` (`name: path`), `enabled`, `world` (map, x, y, z, sandbox, god, closeUI, onStart; also the lab server's world), `heap` (null = game's own), `keep_saves`, `window`, `server` (Multiplayer).
 - `profile/` (gitignored; `profile*/` for alternates) — the game's `-cachedir`: options.ini, mods/ (links + default.txt), Lua/pzlab/ (bridge files), lua-scratch/ (`lab.load_lua` files, cleared by `start`), Saves/, Screenshots/, shots/, console.txt.
-- `harness/PZLabHarness/` — in-game mod (always active in the lab): PZLab_Core (log, files, JSON, handles, compiler reset), PZLab_Bridge (commands, heartbeat, steps), PZLab_Boot (autostart world), PZLab_Tools (helpers, picking, Lua file loading), PZLab_Fixtures (spawn/track/clear test objects, world search, timed actions), PZLab_UI (UI tree, inventory panes, layout snapshots, input recorder), PZLab_UIState (uiState, pause/context menu recovery, ensurePlayable, speed), PZLab_World (zoom, locations, goto, building/open-ground search).
-- `labkit/` — Python: config, detect (game dir, launch spec, version facts read from the install), profile, process, bridge, inputs, capture, imaging/png (Pillow-optional), logs, lab, locations (+ `locations.json`, the catalogue); `luacheck/` (precompiled `LuaCheck.class`, Java 17 bytecode, + source).
+- `<profile>-server/` (`profile-server/`, `profile-agent-server/`, ...; gitignored) — the lab server's `-cachedir` (Multiplayer).
+- `harness/PZLabHarness/` — in-game mod (always active in the lab, on the lab server too). `shared/` (client and server): PZLab_Core (log, files, JSON, handles, compiler reset), PZLab_Bridge (commands, heartbeat, steps), PZLab_Inspect (player, squares, describe objects, where an item is, item search and watch), PZLab_Fixtures (spawn/track/clear test objects, synced to clients when made on a server; world search). `client/`: PZLab_Boot (autostart world), PZLab_Join (joining a server unattended), PZLab_Tools (teleport, picking, Lua file loading, timed actions and their tracing, weather), PZLab_UI (UI tree, inventory panes, layout snapshots, input recorder), PZLab_UIState (uiState, pause/context menu recovery, ensurePlayable, speed), PZLab_World (zoom, locations, goto, building/open-ground search). `server/`: PZLab_Server (server-only helpers; returns early unless `isServer()`, since clients load `server/` too).
+- `labkit/` — Python: config, detect (game dir, client and server launch specs, version facts read from the install), profile, process, bridge, inputs, capture, imaging/png (Pillow-optional), logs, lab, server (the lab server), locations (+ `locations.json`, the catalogue); `luacheck/` (precompiled `LuaCheck.class`, Java 17 bytecode, + source).
 
-Isolation: `-cachedir` keeps everything in the profile; `-nosteam -nosound -novoip -debug`. Outside this repository the lab only *reads*: the game install, Steam's library list, and (in `init` only) two keys of `~/Zomboid/options.ini`. Saves are pruned to `keep_saves`.
+Isolation: `-cachedir` keeps everything in the profile; `-nosteam -nosound -novoip -debug`. The lab server likewise (its own `-cachedir`, `-nosteam`, bound to 127.0.0.1, UPnP off). Outside this repository the lab only *reads*: the game install, Steam's library list, and (in `init` only) two keys of `~/Zomboid/options.ini`. Saves are pruned to `keep_saves` (server worlds: archived, then pruned).
 
-Version-sensitive facts are read from the installed game, not hardcoded: JVM args/classpath/main class from `ProjectZomboid64.json` (only the highest OS-version entry applies), the mods reset-marker name from `GameWindow.class` (`resetDefaultModsForNewRelease("NN_NN")`). If a future build moves them, `doctor` and the stall report point at it.
+Version-sensitive facts are read from the installed game, not hardcoded: JVM args/classpath/main class from `ProjectZomboid64.json` (only the highest OS-version entry applies), the lab server's from the java line of `ProjectZomboidServer.bat` (`detect.server_launch_spec`), the mods reset-marker name from `GameWindow.class` (`resetDefaultModsForNewRelease("NN_NN")`), the sandbox file version from `SandboxOptions.SANDBOX_VERSION` (`detect.class_int_constant`). If a future build moves them, `doctor` and the stall report point at it.
 
 ## Bridge protocol (profile/Lua/pzlab/)
 
 - Per command: `cmd-<seq>.txt` = `PZLAB <seq> <timeoutMs>\n<lua chunk>`, written and closed first, then the empty flag `cmd-<seq>.go`; the controller deletes both after the reply (flag first). `seq` is decimal and increasing.
 - Harness polls every 50 ms from `OnFETick` (menu) / `OnTickEvenPaused` (in game): it *lists* the directory (no open) for flags newer than the last command run, opens that command file once, runs the chunk synchronously via `pcall`, writes `res.json` `{seq, ok, value|error, out, frames, ms}`. So it never opens a file the controller is writing, replacing or deleting (see traps). A fresh Lua state resumes after the `seq` in `res.json`.
 - `locations.txt`: the catalogue as a Lua chunk, written at setup (`PZLab.locations`).
-- Multi-tick: return `PZLab.steps{fn(ctx), n_frames, PZLab.waitMs(ms), PZLab.waitUntil(fn, timeoutMs), ...}`; result = last function's return. **No coroutines** (see traps).
-- `state.json` heartbeat every 0.5 s (in game also `speed` and `pauseMenu`). Stale heartbeat + live process = loading, "Click to Start", or Lua halted → `shot --os`.
+- Multi-tick: return `PZLab.steps{fn(ctx), n_frames, PZLab.waitMs(ms), PZLab.waitUntil(fn, timeoutMs[, describe]), ...}`; result = last function's return; on a timeout `describe(ctx)`'s text is added to the error. **No coroutines** (see traps).
+- `state.json` heartbeat every 0.5 s (in game also `speed` and `pauseMenu`; connected to a server `mp: true`; while joining `connect`, see `PZLab.joinServer`). Stale heartbeat + live process = loading, "Click to Start", or Lua halted → `shot --os`.
+- The lab server runs the same bridge in `<server profile>/Lua/pzlab/`, ticked by `OnTickEvenPaused` (fires on a dedicated server every loop, 10 per second, players or not, paused or not); its heartbeat has `state: "server"` and `players` (`{user, x, y, z, dead}`).
 - `PZLab.out(...)` appends lines to the reply's `out`.
 - Chunks are compiled with `loadstring(chunk, "pzlab")`: in stack traces the chunk is `pzlab`, attributed to the last file the engine ran (see traps). If compiling fails for a reason other than a syntax error (`pzlab:<line>: ...`), the bridge calls `PZLab.resetCompiler()` once and retries, noting it in `out`.
 - Results: every Java object is `{"__java": class, "str", "handle"}` and every UI element table is a summary `{"__ui": Type, "handle", "title", "x", "y", "w", "h", "visible"}`; pass the handle back as `PZLab.get(h)`. An empty Lua table arrives as `{}`.
 
 ## Lua helpers (PZLab.*)
 
-`player()`, `square(x,y,z)`, `teleport(x,y,z)` (whole numbers → tile centre, fractions exact), `toScreen(x,y,z)`, `objectScreenPos(obj)`, `aimPoints(obj, n)` (on-screen points, best first; up to n clear of UI, then up to n where `pickBlockedBy` finds UI, marked `ui = <type>`, `clickThrough`), `isHovered(obj [,x,y [,allowUI]])` (false where `pickBlockedBy` finds UI unless allowUI), `pickCorpse(x,y)` / `pickVehicle(x,y)` (both UI pixels; see traps), `describeObject(obj)`, `describeContainer(c)`, `containersOf(obj)`, `objectsAt(x,y,z)`, `findContainers(radius)`, `ui(includeHidden)`, `closeUI(type)`, `mouse()` (pos + engine-picked object), `give(fullType, n)`, `addToContainer(c, fullType, n)` (untracked), `screenshot(name)`, `launchWorld(cfg)`, `json(v)`, `log(msg)`, `readFile/writeFile(name)`.
+`player()`, `square(x,y,z)`, `teleport(x,y,z)` (whole numbers → tile centre, fractions exact; multiplayer: only sends the server's `/teleportto` and returns `{sent = true}` at once, `gotoLocation` waits), `onMap(x, y)` (the 8×8 chunk has map data: false off the authored map; the metagrid bounds, ±250 cells, and `isValidSquare` don't tell), `toScreen(x,y,z)`, `objectScreenPos(obj)`, `aimPoints(obj, n)` (on-screen points, best first; up to n clear of UI, then up to n where `pickBlockedBy` finds UI, marked `ui = <type>`, `clickThrough`), `isHovered(obj [,x,y [,allowUI]])` (false where `pickBlockedBy` finds UI unless allowUI), `pickCorpse(x,y)` / `pickVehicle(x,y)` (both UI pixels; see traps), `describeObject(obj)`, `describeContainer(c)`, `containersOf(obj)`, `objectsAt(x,y,z)`, `findContainers(radius [, {near = {x,y,z} | player = user}])` (with `handle`), `ui(includeHidden)`, `closeUI(type)`, `mouse()` (pos + engine-picked object), `give(fullType, n)`, `addToContainer(c, fullType, n)` (untracked), `screenshot(name)`, `launchWorld(cfg)`, `clearWeather()` (admin overrides fog and precipitation 0, as the admin panel's climate controls; sent to the server in MP: needs admin), `json(v)`, `log(msg)`, `readFile/writeFile(name)`.
+
+**Where things are** (PZLab_Inspect; client, server and single player alike).
+
+| Lua | Does |
+|---|---|
+| `player(name)` | client: local player 0; server: the connected player `name`, else `PZLab.serverPlayerName`'s (`usePlayer(name)` on the server sets it), else the first connected one (nil when none) |
+| `players()` | `{user, x, y, z, local, handle}` per connected player (server: all; client: itself and the remote players it knows) |
+| `whereIs(item or handle)` | as this side sees it: `{id, type, on = "floor" \| "container" \| "nowhere", path}`; `path` innermost holder first: `{kind = "item", type, id, container}` (a bag), `{kind = "character", user, container}`, `{kind = "object", sprite, index, at, container}` (furniture, crate), `{kind = "corpse", at}`, `{kind = "vehicle", part, vehicle, vehicleId}`, `{kind = "floor", at, x, y, z}` |
+| `placeText(where)` | one line: `"item:Base.Bag_Schoolbag < object:carpentry_01_19"`, `"character:admin"`, `"floor"`, `"nowhere"` |
+| `findItem(id, {near = {x,y,z} \| player = user, radius = 8, zMin, zMax})` | the item with that `InventoryItem:getID()` (identical on server and clients) in connected players' inventories, then in tile containers, floor items (and their contents), corpses and vehicles around the centre (recursive) → item or nil |
+| `locate(id, opts)` | `whereIs(findItem(id, opts))` plus `handle`, or `{id, on = "nowhere"}` |
+| `watchItems(ids, opts)` / `itemWatch(stop)` | from now on, every tick, `placeText` of each item; changes recorded with `getTimestampMs()` (the same clock in a server and a client on one machine) → `{[id] = {place, changes = {{t, from, to}}}}`; `stop` ends it. On the server: when the authoritative location changed |
 
 **Lua files and the compiler** (behind `lab.load_lua`; paths absolute, `/`-separated, under an allowed prefix: see traps).
 
@@ -131,19 +180,23 @@ Version-sensitive facts are read from the installed game, not hardcoded: JVM arg
 
 **Handles.** `handle(v)` → small int id (same object → same id; keys compare with Java `equals`), `get(id)`, `clearHandles()`.
 
-**Fixtures** (lab setup: created directly, tracked, removed by `clearFixtures()` wherever they have moved to — floor, any container, hands). Item spec: list of `"Base.Apple"` | `{"Base.Apple", 3}` | `{"Base.Bag_Schoolbag", 1, contents = {spec}}`.
+**Fixtures** (lab setup: created directly, tracked, removed by `clearFixtures()` wherever they have moved to — floor, any container, hands). Item spec: list of `"Base.Apple"` | `{"Base.Apple", 3}` | `{"Base.Bag_Schoolbag", 1, contents = {spec}}`. In multiplayer, make them on the server (`lab.server.lua(...)`): every creation and removal there is sent to the clients; on an MP client they raise an error, because objects made there exist only in that client (Multiplayer).
 
 | Lua | Does |
 |---|---|
 | `addItems(target, spec)` | create items in a container → top-level InventoryItems. target: ItemContainer, container item, character, tile object/corpse, VehiclePart, floor item, or handle |
 | `spawnWorldItem(fullType, x, y, z, {offX, offY, offZ, contents})` | item on the floor (offsets within the tile, default 0.5, 0.5, 0) → IsoWorldInventoryObject |
 | `spawnCorpse(x, y, z, {female, clothed, contents, blood})` | vanilla `createRandomDeadBody`; unless `clothed` its outfit is stripped, so the container (type `inventorymale`/`inventoryfemale`) holds exactly `contents` → IsoDeadBody |
-| `spawnVehicle(script, x, y, z, dir, {loot, contents = {[partId] = spec}, open, key})` | vanilla `addVehicleDebug` (default `"Base.CarNormal"`, dir `"E"`), centred on the square's NW corner; containers emptied unless `loot`; `open` unlocks/opens doors and trunk; `key` gives the key; the key vanilla drops nearby is removed at once (traps) → BaseVehicle |
+| `spawnVehicle(script, x, y, z, dir, {loot, contents = {[partId] = spec}, open, key})` | vanilla `addVehicleDebug` (default `"Base.CarNormal"`, dir `"E"`), centred on the square's NW corner; containers emptied unless `loot`; `open` unlocks/opens doors and trunk; `key` gives the key; the key vanilla drops nearby is removed at once (traps) → BaseVehicle. Raises where vanilla won't place one (indoors without a vehicle zone, overlapping a vehicle: traps) |
+| `vehiclePlaced(vehicle)` | the vehicle is really in the world: its physics transform matches its x/y |
+| `spawnContainer(sprite, x, y, z, {contents, name})` | a world container: a new tile object from a sprite with a `container` property (default `"carpentry_01_19"`, the player-built wooden crate, type `crate`), `contents` inside → IsoObject (`obj:getContainer()`) |
+| `newItem(fullType, contents)` | a tracked item, contents inside, in no container yet |
 | `vehicleContainers(vehicle)` | `{part, index, type, items, area, world = {x, y}, center = {x, y} (screen), accessible, handle}` per part container |
 | `openVehicleDoors(vehicle, open)` | unlock + open (or close) every door but the hood |
-| `clearFixtures()` / `fixtures()` | remove all tracked fixtures still in the world (newest first) → count / list them |
-| `findObjects({radius=6, zMin, zMax, hasContainer, sprite="pattern", containerType, class="IsoDeadBody", limit})` | tile objects, floor items, corpses and vehicles around the player → `describeObject` + `handle`, `dist`, nearest first |
-| `playerBusy()` / `actionQueue()` | timed actions queued or running (vanilla queue + `isPlayerDoingAction`) / `{busy, queued = {Type...}}` |
+| `clearFixtures()` / `fixtures()` | remove all tracked fixtures still in the world (newest first) → count / list them (`{kind, handle, str, loaded}`). Fixtures whose square isn't live are skipped and stay listed (`loaded = false`): outside the loaded chunks around the player, or on a server further than `PZLab.SERVER_FIXTURE_REACH` (50) tiles from every connected player (traps). After their chunk loads again they are found by item id / a `modData.pzlabFixture` marker |
+| `findObjects({radius=6, zMin, zMax, hasContainer, sprite="pattern", containerType, class="IsoDeadBody", limit, near = {x,y,z}, player = user})` | tile objects, floor items, corpses and vehicles around the player (or `near`) → `describeObject` + `handle`, `dist`, nearest first |
+| `playerBusy()` / `actionQueue()` | client: timed actions queued or running (vanilla queue + `isPlayerDoingAction`) / `{busy, queued = {Type...}}` |
+| `traceActions(classNames)` / `traceAction(action, queued)` / `actionTrace(clear)` | client: wraps the classes' `waitToStart/start/update/perform/stop/forceComplete/forceStop` (default `{"ISInventoryTransferAction"}`; `false` restores them) and records per action: `{n, type, item = {type, id}, src, dest, queued, first, started, ended (ms since tracing began, PZLab.actionTraceStart = its getTimestampMs()), result = "performed" \| "stopped" \| nil (running), waits, updates, maxTime, events = {{name, t, maxTime}}}`; `traceAction(a, true)` before `ISTimedActionQueue.add(a)` records the queue time and returns the record (`n`). In MP an update's maxTime going -1 → n is the server's duration reply |
 
 **UI.**
 
@@ -168,7 +221,7 @@ Version-sensitive facts are read from the installed game, not hardcoded: JVM arg
 | `getZoom()`, `zoomLevels()` | `getCore():getZoom(0)` (> 1 shows more world) / supported levels, closest first (options `zoomLevels2x`/`1x`, empty = all of 0.25..2.5; 1 always) |
 | `setZoom(z, timeoutMs)` | snaps to the nearest level, steps the target there like the mouse wheel (`Core.doZoomScroll`), waits until settled. A steps job: `return PZLab.setZoom(1)` → final zoom. Errors if auto zoom or zoom is off in the options |
 | `locations`, `loadLocations()` | the catalogue (from `pzlab/locations.txt`) |
-| `gotoLocation(nameOr{x,y,z}, {radius = 10, timeoutMs, settleFrames = 10})` | teleport, wait until `areaLoaded`, re-place the player if it dropped, settle → `{name, x, y, z, player, ms}`. A steps job |
+| `gotoLocation(nameOr{x,y,z}, {radius = 10, timeoutMs, settleFrames = 10, anywhere})` | teleport (whole numbers: the tile centre), wait until `areaLoaded`, re-place the player if it dropped, settle, wait until on the target tile → `{name, x, y, z, player, ms}`; timeouts say where the player is. Refuses a target off the map (`onMap`) unless `anywhere`. A steps job. Multiplayer: only the server moves the player: vanilla admin `/teleportto x,y,z` with the exact point (fractions; needs admin), nothing sent when the player already stands within `PZLab.GOTO_ARRIVE` (0.25) of it (`sent = false`); arrived = the client stands within 0.25 of the point; the client never sets its own position (traps). `lab.goto` then waits for the server's copy |
 | `areaLoaded(x, y, z, radius)` | every ground-floor square within radius exists, and the target square |
 | `findBuildings({near = {x, y}, radius = 300, levels, rooms = {...}, anyRooms = {...}, limit = 10})` | buildings anywhere on the map from the metagrid (unloaded too): `levels = 2` means rooms on two floors ≥ 0; `rooms` all present, `anyRooms` one present (map room names: kitchen, bedroom, grocery, gigamart, warehouse, ...) → `{x, y, x2, y2, center, dist, floors = {{z, rooms}}}` nearest first. ~170 ms for the whole map |
 | `findOpenArea(w, h, {radius = 30, z = 0, near})` | nearest loaded w×h rectangle of open outdoor ground (only floor, grass, ground decals: `PZLab.openGroundSprites`; no buildings, walls, fences, trees, furniture, corpses, vehicles) → `{x, y, w, h, center, dist}` or nil |
@@ -205,6 +258,103 @@ Service, overwrite/delete prompts) is a decision for the test or its person, nev
 | `coveredBy(el, x, y)` | false when a click at (x, y) reaches el's own top-level window; else `uiAt`'s description of what is in front, or `{type = "world"}` when no UI takes it |
 | `textFocus()` | text entry holding keyboard focus → `{type, handle, text, root = {type, title, handle}}`, `{type = "unknown", detached = true}` when its window was removed, or false |
 | `escapeAction()` | what an Escape press would do now: `textEntry`, `consumed:<Type>` (a window's `isKeyConsumed`), `cancelPlacement`, `openPauseMenu`, `closePauseMenu`, `menu` (main menu), `none` |
+
+## Multiplayer (lab server + clients)
+
+**Setup**: nothing beyond "New machine": the lab server comes from the installed game (no Steam,
+no dedicated-server download, no Terms of Service screen), each client profile carries the person's
+ToS acceptance like any lab profile. `python pzlab.py start --join --mod-dir <mod>` = server + one
+client in the world; `python pzlab.py stop --all` ends both.
+
+**The lab server** (`labkit/server.py`): `zombie.network.GameServer` with the JVM args, classpath and
+main class of the install's own server launcher (`ProjectZomboidServer.bat` java line; a
+dedicated-server install's `ProjectZomboid64.json`; else the client's spec), `-Dzomboid.steam=0
+-nosteam -cachedir=<server profile> -servername <name> -adminusername/-adminpassword (no
+first-run password prompt) -ip <ip> -port <port> -udpport <udp_port>`, `-Ddebug` if `server.debug`.
+stdin is `<server profile>/pzlab-console.txt`: the server polls stdin every 100 ms, so `command()`
+appends a line and reads the reply from stdout (the server echoes `command entered via server
+console (System.in): "..."` first). Ready = `*** SERVER STARTED ****` in its log plus a fresh
+harness heartbeat; ~45 s cold (first start of a profile ~70 s: world generation).
+
+| `server` key (lab.json) | Default | |
+|---|---|---|
+| `profile_dir` | `<profile_dir>-server` | its `-cachedir` (env `PZLAB_SERVER_PROFILE`) |
+| `name` | `pzlab` | `Server/<name>.ini`, `Saves/Multiplayer/<name>`, `db/<name>.db` |
+| `ip`, `port`, `udp_port` | `127.0.0.1`, 16361, 16362 | bind address (loopback: unreachable from the network), ports (vanilla's 16261 left free) |
+| `admin_user`, `admin_password` | `admin`, `pzlab` | created/updated at every start; `join` uses it by default |
+| `fresh` | true | each start moves the world and `db/<name>.db` (accounts) to `Saves/Multiplayer/<name>_<time>/` (newest `keep_saves` kept): a new world, every client creates a character; `server start --keep-world` / `fresh=False` keeps them |
+| `options` | `{}` | `Server/<name>.ini` values on top of the lab's |
+| `heap`, `debug`, `args` | null, false, [] | -Xmx, -Ddebug, extra server arguments |
+
+Files written at each start: `Server/<name>.ini` (only these keys are set, the server fills in the
+rest: `Mods=PZLabHarness;<the client's enabled mods>`, `Map=<world.map>`, `DefaultPort`, `UDPPort`,
+`SpawnPoint=<world x,y,z>`, `UPnP=false` (vanilla default true maps the port on the router!),
+`Public=false`, `SteamVAC=false`, `SteamScoreboard=false`, `VoiceEnable=false`, no backups,
+`ServerWelcomeMessage=`, `Open=true`, `Password=`, `RCONPassword=`), `<name>_SandboxVars.lua`
+(`world.sandbox` overrides; the server keeps defaults for the rest; `VERSION` read from
+`SandboxOptions.SANDBOX_VERSION` in the jar, without it the loader "upgrades" from version 0),
+`<name>_spawnregions.lua` + `<name>_spawnpoints.lua` (one region, one point at world x, y, z: the
+client skips the spawn-region screen and every new character spawns there). Mods are linked into
+`<server profile>/mods/` like the client's; the server also loads PZLabHarness (it must: a joining
+client reloads its Lua with the server's mod list).
+
+**Joining** (`lab.join`, client/PZLab_Join.lua; ~35-50 s from the menu): vanilla Direct Connect
+(`MainScreen:presentServerConnectPopup`, fields, Connect button). Right after connecting the client
+resets its Lua state and loads the server's mods; the request lives on in `pzlab/join.txt` and the
+fresh harness resumes. Then character creation: the profession screen's and the appearance screen's
+Next/Play buttons are pressed (`ISButton:forceClick`, never a disabled one; the spawn-region list
+too if a server offers several regions), then loading and "Click to Start" (dismissed like a world
+start). A returning character loads straight in. The join report has the timed events. Accounts:
+a client started with `-debug` (lab default) is refused (`UI_OnConnectFailed_DebugNotAllowed`;
+bytecode, `ConnectToServerState`) unless its role has `ConnectWithDebug`: use the admin account, or
+`server user NAME PW` (access admin) for more players. Every connection needs its own account
+(`AlreadyConnected` otherwise; bytecode, `LoginPacket`). Verified failures: nothing listening →
+"Connection Failed" after ~7 s; wrong password → "Wrong username or password given" after ~0.4 s;
+a later `join` from the same client works (the failed connect screen is left first).
+
+**More clients**: `other = lab.client("profile-2")`, `lab.server.ensure_user("p2", "pw")`,
+`other.start(join={"user": "p2", "password": "pw"})` (CLI: `PZLAB_PROFILE=profile-2
+PZLAB_SERVER_PROFILE=<server profile> python pzlab.py start --join --user p2 --password pw`). Each
+is its own game process and window (~4 GB each; the server ~3 GB); input goes to each client's own
+window. Verified with two clients (both on the server's player list and the first client's).
+
+**Server-side Lua** (`server lua`, `lab.server.lua`): the shared harness (Core, Bridge, Inspect,
+Fixtures) plus server/PZLab_Server.lua: `usePlayer(user)`, `serverInfo()` → `{name, players,
+tickEvent, worldAgeHours, sandbox = {Zombies}}`. Differences from a client: no UI, no
+`getSpecificPlayer` (→ `PZLab.player(name)`), `getPlayerFromUsername` returns nil (42.21;
+`PZLab.player` searches `getOnlinePlayers()`), 10 ticks per second (`GameServer.FPS`): a command
+answers within ~100 ms, a `PZLab.steps` entry takes a tick, `waitMs` resolution 100 ms. Only the
+chunks around connected players are live. `reloadLuaFile` works there (`reloadLuaFile(
+getFilenameOfClosure(PZLab.someFunction))`; `lab.reload` and `lab.load_lua` are client-only).
+Console commands that act on a player take a username (`additem "admin" Base.Axe 2`,
+`teleportto`, `godmodplayer`, ...; `help` lists them); an admin client can send the same with
+`SendCommandToServer("/additem ...")`.
+
+**Server truth vs client view**: item ids (`getID()`) are the same on server and clients;
+`PZLab.locate(id)` / `whereIs` / `placeText` on either side, `watchItems` on the server for when
+the authoritative location changed, `traceActions` on the client for what its action did.
+
+**Fixtures in MP** (verified): made on an MP client (`PZLab.allowClientFixtures = true` to allow)
+they exist only there: the server finds nothing (`locate` → nowhere) and rejects a transfer of
+such an item (~30 ms). Made on the server they reach every client with the same ids: items in
+containers (`sendAddItemToContainer`), floor items (`AddWorldInventoryItem` transmits, contents
+included), world containers (`transmitCompleteItemToClients` of the empty object, then each item),
+corpses (`createRandomDeadBody` alone stays server-side; `sendCorpse`), vehicles (server
+authoritative; part contents and the key too). Removals (`clearFixtures` on the server) reach the
+clients (`sendRemoveItemFromContainer`, `transmitRemoveItemFromSquare`, `removeCorpse`,
+`permanentlyRemove`).
+
+**Item transfers in MP** (`scripts/probe_mp.py`, 42.21, admin account, verified with the lab crate
+and with a vanilla counter): an `ISInventoryTransferAction` asks the server for an item transaction
+in `start()` (`createItemTransaction`; `maxTime` -1), the server replies with a duration within
+~50 ms (`maxTime` = 5-50), the action ends with `forceComplete` (done packet) or `forceStop`
+(rejected), and vanilla then clears the rest of the queue after a stop.
+
+| Transfer | Server | Client action |
+|---|---|---|
+| item in a bag in a world container → inventory | accepted (duration 50), never done, nothing sent: the item stays in the bag | runs until the client drops the transaction (duration + 10 s, `TransactionManager` `TRANSACTION_TIMEOUT_BUFFER_MS`), which `isItemTransactionDone` reports as done: `forceComplete`, `perform` after ~11 s, as if it succeeded |
+| inventory → a bag in a world container | rejected | `forceStop` after ~35-45 ms |
+| world container → inventory, inventory → world container, bag on the floor → inventory | moved ~200-310 ms after the action started | `perform` after ~130-230 ms |
 
 ## Engine facts and traps (verified on 42.21)
 
@@ -262,11 +412,24 @@ Service, overwrite/delete prompts) is a decision for the test or its person, nev
 - **Static Java fields read from Lua are a snapshot** taken when the class was exposed: `Core.currentTextEntryBox` is always nil (`getCore():isDoingTextEntry()` is live). Constant references such as `IsoObjectPicker.Instance` work.
 - Top-level UI can be `AtomUI` (B42 PZAPI atoms) rather than `UIElement`: it has `getTable`/`getUIName` but no `getControls` or `isConsumeMouseEvents`. Its hit test (`isOverElement`) covers child nodes outside its own box unless `isStencil` (verified: the world isn't picked there); it consumes a press only when an enabled node under the point has a Lua `onMouseButtonDown` returning true (bytecode, `AtomUI.onConsumeMouseButtonDown`), which `uiAt` can't know, so it assumes the press is taken.
 - Posted key messages for Alt/Shift/Ctrl (`VK_LMENU` etc.) are seen by `isAltKeyDown()`/`isShiftKeyDown()`/`isCtrlKeyDown()` during a following click.
+- **Multiplayer** (verified):
+  - A joining client resets its Lua state right after connecting (before character creation) and reloads with the server's mods: everything a test set in Lua before joining is gone; a mod the server doesn't list isn't loaded in the client.
+  - `getOnlineUsername()` throws (NPE, logged even under pcall) until the player exists; `isClient()` is true from the connection on, also at the menu.
+  - Loading a server's mods, the animator walks every mod's `media/AnimSets` and `media/actiongroups` and logs a `NoSuchFileException` block for each one a mod lacks (client and server); `log --errors` drops them as noise, `log.exceptions` lists them.
+  - The dedicated server's `UPnP` option defaults to true: a first start without the lab's ini maps the port on the router (24 h lease, `PortMapper.addMapping`); the lab sets `UPnP=false` before every start.
+  - **Teleports**: a client-side `teleportTo` far away moves the player (the server follows) but the client draws only a patch around the player, the rest black; the admin command `/teleportto x,y,z` (what `goto` uses) streams the area properly. It takes fractions (`Float.parseFloat`); the server only sends the client a `Teleport` packet (it never moves the player itself), the client sets x/y/z and reports its position, which the server's copy then follows (`PlayerPacket` also sets the connection's `releventPos`). Whole-number coordinates put the player on the tile's north-west corner, where collision pushes them onto a neighbouring tile (6119,5474 → x 6118.97): aim at the centre. A position the client sets itself is checked by the server's no-clip anti-cheat (`AntiCheatNoClip`, skipped for 500 ms after a server teleport and for admins with no-clip on) against `releventPos`, and a move across a blocked edge is answered with a teleport back there. No snap-backs were seen with server teleports to tile centres, also beside a vehicle. A target on a vehicle's tile: its collision pushes the player to the tile's edge or the next tile.
+  - **Off the map** (e.g. near 0,0) the player has no square on either side and queued timed actions never start (the player stays busy, nothing moves, inventory-only transfers included); `goto` refuses such targets (`PZLab.onMap`).
+  - **`addVehicleDebug` on a spot vanilla rejects** (`IsoChunk.doSpawnedVehiclesInInvalidPosition`: indoors without a vehicle zone, or overlapping another vehicle) still returns a vehicle, never added to the world: its transform stays at 0,0, so `getAreaCenter`/`getWorldPos` give points near the map origin; on a server its id stays -1 and no client ever sees it. A goto computed from such an area centre lands off the map. `spawnVehicle` raises instead (`PZLab.vehiclePlaced`).
+  - The chat window (`ISChat`, ~500×200 at the left) covers the world: no picking/hover there (`lab.join` closes it unless `close_chat=False`). The server's random weather often starts in dense fog (white screenshots); the `stopweather` console command doesn't clear fog, admin climate overrides do (`PZLab.clearWeather`, fades in a few seconds).
+  - A container object sent with `transmitCompleteItemToClients` while it already holds items made the client log `Error: Dupe item ID` for them: send it empty, then the items (`spawnContainer` does).
+  - On a server, removals far from every player are lost: `getGridSquare` still returns squares of cells no player uses, the removal "works", but when a player comes back the objects are there again (the cell's save didn't take it); `DoRemoveItem` of food there also fails to send `ItemStats` (`Unable to resolve container location`). After a cell reloads, the world holds new Java objects (items keep their ids). `clearFixtures` handles both (reach rule, refresh by id / modData marker).
+  - The client's own cache of a server lives in `<profile>/Saves/Multiplayer/<ip>_<port>_<md5(user)>/` (pruned with the other saves); whether a character exists is asked from the server (`checkSavePlayerExists` → `ClientPlayerDB`).
 
 ## Not yet supported / caveats
 
 - Windows only for input injection, OS capture and process control (Linux/macOS: launch/bridge code is mostly portable but untested).
 - Keys are sent by US-layout virtual-key codes; on other keyboard layouts letter keys may map to different game keys.
 - Display scaling other than 100% is untested (GLFW is DPI-aware, so client pixels should still equal UI pixels).
-- Multiplayer (co-op host + client), controller input, multiple simultaneous lab instances.
+- Multiplayer: no co-op hosting (in-game host) or Steam servers; joins other servers only by ip/port/account; clients run with `-debug`, so they need admin (`ConnectWithDebug`) accounts. Several lab sessions at once need distinct profiles and distinct `server.port`s (several clients on one lab server work).
+- Controller input.
 - VS Code panel viewer (stream frames + forward input) is a planned layer on top of `capture`/`inputs`.

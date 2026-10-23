@@ -1,4 +1,4 @@
-"""Launching and stopping the game process for the lab profile."""
+"""Launching and stopping the game client and the lab server processes."""
 
 import json
 import os
@@ -29,37 +29,73 @@ def command(cfg):
             spec["main_class"], "-cachedir=" + str(cfg.profile_dir), *cfg["game_args"]]
 
 
-def read_pid(cfg):
+def server_command(cfg):
+    """The install's dedicated-server launch spec (detect.server_launch_spec) with Steam off, the
+    lab server profile as -cachedir, loopback binding and the lab's admin account."""
+    server = cfg["server"]
+    spec = detect.server_launch_spec(cfg.game_dir)
+    vm_args = spec["vm_args"]
+    if server["heap"]:
+        vm_args = [a for a in vm_args if not a.startswith("-Xmx")] + ["-Xmx" + server["heap"]]
+    if server["debug"]:
+        vm_args = vm_args + ["-Ddebug"]
+    return [str(java_exe(cfg.game_dir)), *vm_args, "-cp", os.pathsep.join(spec["classpath"]),
+            spec["main_class"], "-cachedir=" + str(cfg.server_profile_dir), "-servername", server["name"],
+            "-adminusername", server["admin_user"], "-adminpassword", server["admin_password"],
+            "-nosteam", "-ip", server["ip"], "-port", str(server["port"]), "-udpport", str(server["udp_port"]),
+            *server["args"]]
+
+
+def read_pid_file(pid_file):
     try:
-        return json.loads(cfg.pid_file.read_text())
+        return json.loads(pid_file.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return None
 
 
-def running_pid(cfg):
-    info = read_pid(cfg)
+def running_pid_file(pid_file):
+    info = read_pid_file(pid_file)
     if info and win32.process_alive(info["pid"]):
         return info["pid"]
     return None
 
 
-def launch(cfg):
-    if running_pid(cfg):
-        raise RuntimeError("lab game already running (pid %s)" % running_pid(cfg))
-    args = command(cfg)
-    log = open(cfg.profile_dir / "stdout.log", "wb")
+def read_pid(cfg):
+    return read_pid_file(cfg.pid_file)
+
+
+def running_pid(cfg):
+    return running_pid_file(cfg.pid_file)
+
+
+def start_process(args, cwd, pid_file, log_path, stdin_path=None, what="lab game"):
+    """Starts a detached process (no console window, outlives the caller) with stdout+stderr in
+    log_path and stdin read from stdin_path (None: no input); records it in pid_file."""
+    if running_pid_file(pid_file):
+        raise RuntimeError("%s already running (pid %s)" % (what, running_pid_file(pid_file)))
+    log = open(log_path, "wb")
+    stdin = open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL
     base = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-    # Break away from any job object so the game outlives the shell that started it.
-    for flags in (base | CREATE_BREAKAWAY_FROM_JOB, base):
-        try:
-            proc = subprocess.Popen(args, cwd=str(cfg.game_dir), stdin=subprocess.DEVNULL, stdout=log,
-                                    stderr=subprocess.STDOUT, creationflags=flags, close_fds=True)
-            break
-        except OSError:
-            if flags == base:
-                raise
-    cfg.pid_file.write_text(json.dumps({"pid": proc.pid, "started": time.time(), "args": args}))
+    try:
+        # Break away from any job object so the game outlives the shell that started it.
+        for flags in (base | CREATE_BREAKAWAY_FROM_JOB, base):
+            try:
+                proc = subprocess.Popen(args, cwd=str(cwd), stdin=stdin, stdout=log,
+                                        stderr=subprocess.STDOUT, creationflags=flags, close_fds=True)
+                break
+            except OSError:
+                if flags == base:
+                    raise
+    finally:
+        log.close()
+        if stdin_path:
+            stdin.close()
+    pid_file.write_text(json.dumps({"pid": proc.pid, "started": time.time(), "args": args}))
     return proc.pid
+
+
+def launch(cfg):
+    return start_process(command(cfg), cfg.game_dir, cfg.pid_file, cfg.profile_dir / "stdout.log")
 
 
 def game_window(pid):

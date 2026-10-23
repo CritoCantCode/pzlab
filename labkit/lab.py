@@ -13,6 +13,7 @@ from .bridge import Bridge, LuaError
 from .config import LAB_ROOT, Config
 from .inputs import Input
 from .logs import Log
+from .server import Server
 
 
 class NotPlayable(RuntimeError):
@@ -35,10 +36,14 @@ def _ui_lists(state):
 
 
 class Lab:
-    def __init__(self, config_path=None):
-        self.cfg = Config(config_path)
+    def __init__(self, config_path=None, profile=None, server_profile=None):
+        """profile / server_profile: the client's and the lab server's profile folders (relative to
+        the repository), overriding lab.json and the PZLAB_PROFILE / PZLAB_SERVER_PROFILE env."""
+        self.config_path = config_path
+        self.cfg = Config(config_path, profile, server_profile)
         self.bridge = Bridge(self.cfg.lua_dir)
         self.log = Log(self.cfg)
+        self.server = Server(self.cfg)  # the lab server (multiplayer); see labkit/server.py
         self._input = None
         self.last_hover = None
 
@@ -61,6 +66,7 @@ class Lab:
         self.cfg = Config()
         self.bridge = Bridge(self.cfg.lua_dir)
         self.log = Log(self.cfg)
+        self.server = Server(self.cfg)
         result = {"wrote": str(local_path), "game_dir": str(game), "imported": personal}
         if "termsOfServiceVersion" not in personal:
             result["action_needed"] = ("No Terms of Service acceptance found on this machine. Run "
@@ -80,6 +86,8 @@ class Lab:
             report["java"] = str(process.java_exe(game))
             report["mods_reset_marker"] = detect.mods_reset_marker(game)
             report["launch"] = process.command(self.cfg)
+            report["server_launch"] = process.server_command(self.cfg)
+            report["server_launch_source"] = detect.server_launch_spec(game)["source"]
         except (FileNotFoundError, ValueError) as e:
             report["problem"] = str(e)
         options = self.cfg.profile_dir / "options.ini"
@@ -104,8 +112,30 @@ class Lab:
         ids = profile.write_active_mods(cfg, [profile.mod_id(cfg, n) if n in cfg.mods else n for n in names])
         return {"profile": str(cfg.profile_dir), "game_dir": str(cfg.game_dir), "active_mods": ids}
 
-    def start(self, enable=None, world=None, autostart=True, wait=True, timeout_s=300, mod_dirs=None):
+    def client(self, profile):
+        """Another lab client, with its own profile folder (e.g. "profile-2"), for this lab's
+        server: multiplayer tests with several players. Each client is a separate game process
+        and window; join each with its own account (lab.server.ensure_user, then
+        other.start(join={"user": ..., "password": ...}))."""
+        return Lab(self.config_path, profile=profile, server_profile=self.cfg.server_profile_dir)
+
+    def start(self, enable=None, world=None, autostart=True, wait=True, timeout_s=300, mod_dirs=None,
+              join=False):
+        """Sets up the profile and launches the game: into a fresh single-player world (autostart),
+        or to the main menu (autostart=False). join=True (or a dict of Lab.join arguments, e.g.
+        {"user": "player2", "password": "pw"}): multiplayer instead: starts the lab server first
+        if it isn't running (same mods and world), launches to the main menu and joins it
+        (Lab.join); result["join"] has the join report."""
         cfg = self.cfg
+        if join:
+            server = None
+            if not self.server.pid():
+                server = self.server.start(enable, mod_dirs, world=world, timeout_s=timeout_s)
+            result = self.start(enable, world, autostart=False, wait=True, timeout_s=timeout_s, mod_dirs=mod_dirs)
+            if server:
+                result["server"] = {k: server.get(k) for k in ("pid", "address", "active_mods", "archived", "ready_s")}
+            result["join"] = self.join(timeout_s=timeout_s, **(join if isinstance(join, dict) else {}))
+            return result
         info = self.setup(enable, mod_dirs)
         profile.clear_runtime_files(cfg)
         profile.clear_lua_scratch(cfg)
@@ -136,11 +166,12 @@ class Lab:
             return {"launched": spec}
         return {"launched": spec, "state": self.wait_state("ingame", timeout_s, log_offset=log_offset)}
 
-    def wait_state(self, target, timeout_s=300, settle_s=2.0, log_offset=None):
+    def wait_state(self, target, timeout_s=300, settle_s=2.0, log_offset=None, check=None):
         """Waits until the harness heartbeat reports `target` ("menu" or "ingame").
 
         Loading a world ends on a "Click to Start" screen where no Lua runs; when waiting for
-        "ingame" with a log_offset, a click is injected once the log says loading finished."""
+        "ingame" with a log_offset, a click is injected once the log says loading finished.
+        check(state) is called with every heartbeat read (may be None) and may raise to stop."""
         deadline = time.time() + timeout_s
         next_click = 0
         while time.time() < deadline:
@@ -148,6 +179,8 @@ class Lab:
                 raise RuntimeError("game exited while waiting for '%s'. Errors:\n%s"
                                    % (target, "\n".join(self.log.errors(since=0)[-40:])))
             state = self.bridge.state()
+            if check:
+                check(state)
             if state and state["age_s"] < 3 and state["state"] == target:
                 time.sleep(settle_s)
                 return self.bridge.state() or state
@@ -184,6 +217,66 @@ class Lab:
                           "A person must click ACCEPT in the game window (it may be behind other windows), "
                           "or run `pzlab.py init` if they already accepted in their own Zomboid profile.")
         return "\n".join(report)
+
+    def join(self, user=None, password=None, server_password="", ip=None, port=None, timeout_s=300,
+             close_chat=True, clear_weather=True):
+        """Joins a multiplayer server from the main menu of the running lab client (default: the
+        lab server, as its admin account) and waits until the player is in the world. Drives the
+        vanilla Direct Connect popup and, on a first join, character creation (PZLab.joinServer,
+        client/PZLab_Join.lua), then dismisses "Click to Start". A client started with -debug
+        (the lab default) is refused by the server unless the account may ConnectWithDebug
+        (admin; lab.server.ensure_user creates others). Raises RuntimeError with vanilla's
+        reason and the join events when the connection fails.
+        Once in the world: lab.json world.closeUI is applied; close_chat also takes the chat window
+        (ISChat) out of the UI, which covers the left of the screen and so blocks world picking
+        there; clear_weather runs PZLab.clearWeather (admin fog/precipitation overrides; the
+        server's random weather often starts in dense fog).
+        Returns {user, ip, port, created (character creation was driven), pressed, events, ms, state}."""
+        server = self.cfg["server"]
+        cfg = {"ip": ip or server["ip"], "port": int(port or server["port"]),
+               "user": user or server["admin_user"],
+               "password": server["admin_password"] if password is None and not user else (password or ""),
+               "serverPassword": server_password or ""}
+        state = self.bridge.state()
+        if state and state.get("state") == "ingame":
+            raise RuntimeError("the lab client is already in a game; stop it or quit to the main menu first")
+        if not state or state.get("state") != "menu" or state.get("age_s", 99) > 3:
+            self.wait_state("menu", timeout_s=min(timeout_s, 120))
+        started = time.time()
+        offset = self.log.size()
+        attempt = self.lua("return PZLab.joinServer(%s).started" % profile.to_lua(cfg))
+        # The client resets its Lua state after connecting (PZLab_Join.lua resumes from join.txt),
+        # so events and pressed screens are collected across heartbeats; a heartbeat written before
+        # this attempt (an earlier one's state) is skipped.
+        events, pressed = [], []
+
+        def check(state):
+            connect = (state or {}).get("connect")
+            if not connect or connect.get("started") != attempt:
+                return
+            for e in connect.get("events") or []:
+                if e not in events:
+                    events.append(e)
+            for screen in connect.get("pressed") or []:
+                if screen not in pressed:
+                    pressed.append(screen)
+            if connect.get("phase") == "failed":
+                raise RuntimeError("joining %s:%s as %s failed: %s\nevents:\n  %s" % (
+                    cfg["ip"], cfg["port"], cfg["user"], connect.get("message"), "\n  ".join(events)))
+
+        final = self.wait_state("ingame", timeout_s, log_offset=offset, check=check)
+        closing = list(self.cfg["world"].get("closeUI") or []) + (["ISChat"] if close_chat else [])
+        if closing:
+            self.lua("PZLab.pendingCloseUI = %s return true" % profile.to_lua(closing))
+        if clear_weather:
+            self.lua("return PZLab.clearWeather()")
+        try:
+            self.place_window()
+        except RuntimeError:
+            pass
+        return {"user": cfg["user"], "ip": cfg["ip"], "port": cfg["port"],
+                "created": "CharacterCreationMain" in pressed, "pressed": pressed,
+                "events": events, "ms": int((time.time() - started) * 1000), "state": final}
 
     def stop(self, timeout_s=20, force=False):
         cfg = self.cfg
@@ -608,18 +701,49 @@ class Lab:
         """The test-location catalogue (labkit/locations.json): name -> entry."""
         return locations.load()
 
-    def goto(self, target, radius=10, timeout_s=30):
+    def goto(self, target, radius=10, timeout_s=30, anywhere=False):
         """Teleports the player to a catalogue location (name) or (x, y[, z]) and waits until the
-        area around it is loaded and the player stands there (PZLab.gotoLocation).
-        Returns {name, x, y, z, player, ms}."""
+        area around it is loaded and the player stands there (PZLab.gotoLocation; whole numbers =
+        the tile centre). Refuses a target off the map (PZLab.onMap) unless anywhere=True.
+        Multiplayer: the server teleports the player (admin); when the client is on the lab
+        server, also waits until the server has the player at the client's position
+        (result["server"]). Returns {name, x, y, z, player, ms[, sent, server]}."""
         pos = locations.position(target)
         spec = {"x": pos["x"], "y": pos["y"], "z": pos["z"]}
-        result = self.lua("return PZLab.gotoLocation(%s, { radius = %d, timeoutMs = %d })"
-                          % (profile.to_lua(spec), radius, timeout_s * 1000),
+        opts = {"radius": radius, "timeoutMs": int(timeout_s * 1000)}
+        if anywhere:
+            opts["anywhere"] = True
+        result = self.lua("return PZLab.gotoLocation(%s, %s)" % (profile.to_lua(spec), profile.to_lua(opts)),
                           timeout_ms=int(timeout_s * 1000) + 10000)
         if isinstance(target, str):
             result["name"] = target
+        if "sent" in result:  # multiplayer
+            server = self._server_agrees(result["player"])
+            if server:
+                result["server"] = server
         return result
+
+    def _server_agrees(self, client_pos, timeout_s=5.0, tolerance=0.3):
+        """Multiplayer on the lab server: waits until the server's copy of this client's player is
+        within `tolerance` tiles of client_pos (it follows the client's position packets) and
+        returns it; None when the client isn't on the lab server. Raises TimeoutError otherwise."""
+        if not self.server.pid():
+            return None
+        user = self.lua("return getOnlineUsername()")
+        code = ("local p = PZLab.player(%s) if not p then return false end "
+                "return { x = p:getX(), y = p:getY(), z = p:getZ() }" % profile.to_lua(user))
+        deadline = time.time() + timeout_s
+        while True:
+            server = self.server.lua(code)
+            if server is False or server is None:
+                return None  # not a player of the lab server
+            if (abs(server["x"] - client_pos["x"]) <= tolerance and abs(server["y"] - client_pos["y"]) <= tolerance
+                    and int(server["z"]) == int(client_pos["z"])):
+                return server
+            if time.time() >= deadline:
+                raise TimeoutError("after goto the lab server still has %s at %s, the client at %s"
+                                   % (user, server, client_pos))
+            time.sleep(0.1)
 
     # Fixtures -------------------------------------------------------------------------------
 
