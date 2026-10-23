@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from . import detect, imaging, locations, process, profile, win32
-from .bridge import Bridge
+from .bridge import Bridge, LuaError
 from .config import LAB_ROOT, Config
 from .inputs import Input
 from .logs import Log
@@ -108,6 +108,7 @@ class Lab:
         cfg = self.cfg
         info = self.setup(enable, mod_dirs)
         profile.clear_runtime_files(cfg)
+        profile.clear_lua_scratch(cfg)
         pruned = profile.prune_saves(cfg, cfg["keep_saves"])
         if autostart:
             profile.write_autostart(cfg, dict(cfg["world"], **(world or {})))
@@ -234,6 +235,69 @@ class Lab:
                 game_path = link / source_file.relative_to(root)
                 return self.lua("return PZLab.reload(%s)" % profile.to_lua(str(game_path)))
         raise ValueError("%s is not inside any mod linked into the lab profile" % source_file)
+
+    # Lua files through the engine's file loader --------------------------------------------
+
+    LUA_AFTER_FILE = "_pzlab_bridge.lua"  # reserved: run after each load (see load_lua)
+
+    def lua_file_path(self, name):
+        """Where load_lua keeps the file `name` (".lua" appended if missing; subfolders with "/"):
+        <profile>/lua-scratch/<name>. Raises ValueError for names the engine or the lab refuses."""
+        name = name.replace("\\", "/")
+        if not name.endswith(".lua"):
+            name += ".lua"
+        parts = name.split("/")
+        # reloadLuaFile silently refuses any path containing ".." (LuaManager.hasRelativePath)
+        if (".." in name or name.startswith("/") or any(p in ("", ".") for p in parts)
+                or re.search(r'[<>:"|?*\x00-\x1f]', name) or parts[0].startswith("_pzlab")):
+            raise ValueError("invalid Lua file name %r (relative, no '..', not starting with _pzlab)" % name)
+        return self.cfg.lua_scratch_dir.joinpath(*parts)
+
+    def load_lua(self, name, source, hot=None, timeout_ms=10000):
+        """Runs Lua `source` as the file `name` through the engine's own file loader, from the
+        lab's scratch folder (<profile>/lua-scratch/, under the cachedir, which reloadLuaFile
+        accepts). The chunk gets real file semantics: its file name in prototypes and stack
+        traces, and the engine's hot reload when loaded again under the same name.
+
+        hot=None: the first load of `name` in this game session runs like the engine's boot-time
+        load of a mod file (Events.X.Add registers), later loads are hot reloads; hot=True:
+        always reloadLuaFile (Events.X.Add/Remove do nothing, new closures reroute registered
+        callbacks: AGENT.md traps); hot=False: always boot-like. Source that doesn't compile
+        raises LuaError and is not loaded. Runtime errors don't raise: they are in "errors"
+        (log.exceptions logged during the load; also "error" for a boot-like load).
+        Returns {name, path, hot, loads, value (the chunk's first return value), errors[, error]}."""
+        path = self.lua_file_path(name)
+        game_path = path.as_posix()
+        info = self.lua("return PZLab.luaFileInfo(%s, %s)" % (profile.to_lua(game_path),
+                                                              profile.lua_long_string(source)), timeout_ms)
+        if info.get("compileError"):
+            raise LuaError("%s does not compile: %s" % (name, info["compileError"]), info)
+        hot = info.get("loads", 0) > 0 if hot is None else bool(hot)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        after = self.cfg.lua_scratch_dir / self.LUA_AFTER_FILE
+        if not after.exists():
+            after.write_bytes(b"")
+        data = source.encode("utf-8")
+        # Boot-like: the file is empty while the engine runs it (it only sets the compiler's
+        # current file), the source goes inline; then the file gets the source for later reloads.
+        path.write_bytes(data if hot else b"")
+        offset = self.log.size()
+        try:
+            result = self.lua("return PZLab.loadLua(%s, %s, %s, %s)" % (
+                profile.to_lua(game_path), "nil" if hot else profile.lua_long_string(source),
+                profile.to_lua(hot), profile.to_lua(after.as_posix())), timeout_ms)
+        finally:
+            if not hot:
+                path.write_bytes(data)
+        result["name"] = path.relative_to(self.cfg.lua_scratch_dir).as_posix()
+        result.setdefault("value", None)  # a nil field is absent from the JSON reply
+        result["errors"] = self.log.exceptions(since=offset)
+        return result
+
+    def clear_lua_files(self):
+        """Deletes every file load_lua wrote (also done by start); returns how many. Code the
+        game already loaded from them stays loaded."""
+        return profile.clear_lua_scratch(self.cfg)
 
     def check(self, paths):
         """Syntax-checks Lua files/dirs with the game's own Kahlua compiler (no game launch, no JDK)."""
@@ -374,22 +438,43 @@ class Lab:
                 return False
             time.sleep(poll_s)
 
+    def _covered(self, pane, x, y):
+        """PZLab.coveredBy: what takes a click at (x, y) instead of the pane's window, or None."""
+        return self.lua("return PZLab.coveredBy(%d, %r, %r)" % (pane, x, y)) or None
+
+    @staticmethod
+    def _describe_ui(d):
+        """'ISInventoryPage "Loot" (handle 12)' for a PZLab.uiAt description."""
+        if d.get("type") == "world":
+            return "no window (the click would reach the world)"
+        text = d.get("type") or "?"
+        if d.get("title") or d.get("name"):
+            text += ' "%s"' % (d.get("title") or d.get("name"))
+        if d.get("handle") is not None:
+            text += " (handle %s)" % d["handle"]
+        return text + (", capturing the mouse" if d.get("capture") else "")
+
     def drag_row(self, src_pane, row_index, dst_pane, modifiers=(), steps=10, settle_s=0.15, phase_timeout_s=2):
         """Drags row `row_index` (PZLab.paneRows index) of inventory pane `src_pane` onto pane
-        `dst_pane` (handles) with real mouse input, holding `modifiers` throughout. Each phase
-        waits for the game to acknowledge it, so slow frames can't reorder press and moves: the
-        row is under the mouse (src.mouseOverOption), the press started vanilla's item drag
-        (ISMouseDrag.draggingFocus == src), the destination sees the mouse (isMouseOver), and the
-        drop was handled (ISMouseDrag.dragging cleared). Returns what it did, including the
-        player's action queue right after the drop; wait for the transfer with
-        lab.wait_until("not PZLab.playerBusy()")."""
+        `dst_pane` (handles) with real mouse input, holding `modifiers` throughout. First checks
+        that nothing covers the row or the drop point (PZLab.coveredBy): a window in front would
+        take the press or the drop, so it raises naming that window instead of dragging. Each
+        phase waits for the game to acknowledge it, so slow frames can't reorder press and
+        moves: the row is under the mouse (src.mouseOverOption), the press started vanilla's
+        item drag (ISMouseDrag.draggingFocus == src), the destination sees the mouse
+        (isMouseOver), and the drop was handled (ISMouseDrag.dragging cleared). Returns what it
+        did, including the player's action queue right after the drop; wait for the transfer
+        with lab.wait_until("not PZLab.playerBusy()")."""
         info = self.lua("""
             local rows, row = PZLab.paneRows(%d), nil
             for _, r in ipairs(rows) do if r.index == %d then row = r end end
             local visible = {}
             for i, r in ipairs(rows) do visible[i] = r.index end
-            return { row = row, visible = visible, dst = PZLab.paneInfo(%d) }
-        """ % (src_pane, row_index, dst_pane))
+            local dst = PZLab.paneInfo(%d)
+            return { row = row, visible = visible, dst = dst,
+                     srcCover = row and PZLab.coveredBy(%d, row.point.x, row.point.y) or false,
+                     dstCover = PZLab.coveredBy(%d, dst.drop.x, dst.drop.y) }
+        """ % (src_pane, row_index, dst_pane, src_pane, dst_pane))
         row, dst = info.get("row"), info["dst"]
         if not row:
             raise ValueError("row %d of pane %d is not on screen (visible rows: %s)"
@@ -398,6 +483,18 @@ class Lab:
             raise ValueError("destination pane %d shows no list area (window collapsed or hidden?); "
                              "for vanilla windows call PZLab.openInventoryWindows() first" % dst_pane)
         (x1, y1), (x2, y2) = (row["point"]["x"], row["point"]["y"]), (dst["drop"]["x"], dst["drop"]["y"])
+        for what, pane, point, cover in (("row %d of pane %d" % (row_index, src_pane), src_pane, (x1, y1),
+                                          info.get("srcCover")),
+                                         ("the drop point of pane %d" % dst_pane, dst_pane, (x2, y2),
+                                          info.get("dstCover"))):
+            if cover:
+                raise RuntimeError("%s is covered at %s by %s: a click there goes to it, not to the pane's "
+                                   "window; move or close it first" % (what, point, self._describe_ui(cover)))
+
+        def covered_note(pane, x, y):
+            cover = self._covered(pane, x, y)
+            return "; the point is now covered by %s" % self._describe_ui(cover) if cover else ""
+
         inp = self.input
         src_el, dst_el = "PZLab.uiElement(%d)" % src_pane, "PZLab.uiElement(%d)" % dst_pane
         held = inp.press_modifiers(modifiers)
@@ -406,23 +503,27 @@ class Lab:
             inp.move(x1, y1)
             time.sleep(settle_s)
             if not self._poll("%s.mouseOverOption == %d" % (src_el, row_index), phase_timeout_s):
-                raise RuntimeError("mouse at %s but pane %d has mouseOverOption %r, not row %d" % (
-                    (x1, y1), src_pane, self.lua("return %s.mouseOverOption" % src_el), row_index))
+                raise RuntimeError("mouse at %s but pane %d has mouseOverOption %r, not row %d%s" % (
+                    (x1, y1), src_pane, self.lua("return %s.mouseOverOption" % src_el), row_index,
+                    covered_note(src_pane, x1, y1)))
             inp.down("left")
             pressed = True
             if not self._poll("ISMouseDrag.dragging ~= nil and ISMouseDrag.draggingFocus == %s" % src_el,
                               phase_timeout_s):
-                raise RuntimeError("pressing row %d of pane %d did not start an item drag" % (row_index, src_pane))
+                raise RuntimeError("pressing row %d of pane %d did not start an item drag%s"
+                                   % (row_index, src_pane, covered_note(src_pane, x1, y1)))
             for i in range(1, steps + 1):
                 inp.move(x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps)
                 time.sleep(inp.frame_s)
             if not self._poll("%s:isMouseOver()" % dst_el, phase_timeout_s):
-                raise RuntimeError("destination pane %d does not see the mouse at %s" % (dst_pane, (x2, y2)))
+                raise RuntimeError("destination pane %d does not see the mouse at %s%s"
+                                   % (dst_pane, (x2, y2), covered_note(dst_pane, x2, y2)))
             time.sleep(settle_s)
             inp.up("left")
             pressed = False
             if not self._poll("ISMouseDrag.dragging == nil", phase_timeout_s):
-                raise RuntimeError("the drop on pane %d was not handled (ISMouseDrag.dragging still set)" % dst_pane)
+                raise RuntimeError("the drop on pane %d was not handled (ISMouseDrag.dragging still set)%s"
+                                   % (dst_pane, covered_note(dst_pane, x2, y2)))
         finally:
             if pressed:
                 inp.up("left")

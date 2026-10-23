@@ -417,6 +417,61 @@ function PZLab.screenshot(name)
     return true
 end
 
+---------------------------------------------------------------------------------------------
+-- Lua files through the engine's own file loader (LuaManager.RunLua). reloadLuaFile only takes
+-- paths under a prefix ZomboidFileSystem.validatePrefix accepts: the cachedir (the lab
+-- profile), an active mod's folder or the game folder. The controller writes the files
+-- (lab.load_lua: <profile>/lua-scratch/); Lua can't (getFileWriter refuses .lua).
+---------------------------------------------------------------------------------------------
+
+-- Hot-reloads a Lua file by absolute path (vanilla reloadLuaFile).
 function PZLab.reload(path)
     return reloadLuaFile(path)
+end
+
+-- path -> times PZLab.loadLua ran it in this Lua session
+PZLab.luaFileLoads = PZLab.luaFileLoads or {}
+
+local function fileName(path)
+    return string.match(path, "([^/\\]+)$") or path
+end
+
+-- Checked before PZLab.loadLua: { loads = PZLab.luaFileLoads[path] or 0, compileError = the
+-- compiler's message or nil }. A loadstring compile error logs nothing, whereas reloadLuaFile
+-- on a file that doesn't compile logs it and leaves event rewriting on (see AGENT.md traps).
+function PZLab.luaFileInfo(path, source)
+    local _, err = loadstring(source, fileName(path))
+    return { loads = PZLab.luaFileLoads[path] or 0, compileError = err }
+end
+
+-- Runs the Lua file at path (absolute, '/'-separated) through the engine's file loader.
+-- hot = true: reloadLuaFile(path), the engine's hot reload: LuaCompiler.rewriteEvents is on
+--   while it runs, so Events.X.Add/Remove do nothing and every closure it creates replaces
+--   registered event callbacks with the same prototype file and name (LuaEventManager.reroute).
+-- hot = false: like the engine's boot-time load of a mod file (no rewriting: Events.X.Add
+--   registers). The file at path must be empty now: reloadLuaFile(path) then only points the
+--   compiler at path (FuncState.currentFile/currentfullFile, which every compiled function
+--   records), and source, compiled right after, gets the prototypes RunLua would give it.
+-- afterPath (optional): an empty file run last, so that code compiled later (bridge chunks)
+--   is attributed to it rather than to path.
+-- Returns { path, hot, loads, value (the chunk's first return value), error (hot = false: the
+-- chunk's runtime error; the engine logs it either way) }.
+function PZLab.loadLua(path, source, hot, afterPath)
+    local loads = (PZLab.luaFileLoads[path] or 0) + 1
+    PZLab.luaFileLoads[path] = loads
+    local result = { path = path, hot = hot == true, loads = loads }
+    if hot then
+        result.value = reloadLuaFile(path)
+    else
+        reloadLuaFile(path)
+        local fn, err = loadstring(source, fileName(path))
+        if not fn then
+            result.error = "compile error: " .. tostring(err)
+        else
+            local ok, value = pcall(fn)
+            if ok then result.value = value else result.error = tostring(value) end
+        end
+    end
+    if afterPath then reloadLuaFile(afterPath) end
+    return result
 end

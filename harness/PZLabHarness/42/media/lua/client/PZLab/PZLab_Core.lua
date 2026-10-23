@@ -18,6 +18,31 @@ function PZLab.disableDebuggerOnError()
 end
 PZLab.disableDebuggerOnError()
 
+-- Repairs the compiler state a reloadLuaFile leaves behind when it ends in an exception (a
+-- compile error, or LuaEventManager.reroute's NPE on a callback with a nil prototype name):
+-- LuaCompiler.rewriteEvents stays on, so Events.X.Add/Remove do nothing and every new closure
+-- is rerouted (see AGENT.md "Hot reload and events"). Reloading this file (reload-safe,
+-- registers no events) runs LuaManager.RunLua to its end, which turns rewriting off again.
+function PZLab.resetCompiler()
+    return reloadLuaFile(getFilenameOfClosure(PZLab.log))
+end
+
+-- True while Events.X.Add/Remove are no-ops (LuaCompiler.rewriteEvents on): during a
+-- reloadLuaFile, and after one that ended in an exception. Registers a probe on a private
+-- event and fires it.
+function PZLab.eventsRewriting()
+    if not PZLab.probeEventAdded then
+        LuaEventManager.AddEvent("PZLabEventProbe")
+        PZLab.probeEventAdded = true
+    end
+    local hit = false
+    local probe = function() hit = true end
+    Events.PZLabEventProbe.Add(probe)
+    triggerEvent("PZLabEventProbe")
+    Events.PZLabEventProbe.Remove(probe)
+    return not hit
+end
+
 -- Returns the whole file as a string, or nil when it doesn't exist.
 function PZLab.readFile(name)
     local ok, reader = pcall(getFileReader, PZLab.DIR .. name, false)

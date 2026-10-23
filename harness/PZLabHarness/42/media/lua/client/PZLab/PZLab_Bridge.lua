@@ -198,6 +198,15 @@ local function poll()
     local c = { seq = seq, timeout = tonumber(timeout), started = getTimestampMs(), out = {}, frames = 0 }
     c.deadline = c.started + c.timeout
     local fn, err = loadstring(body, "pzlab")
+    if not fn and not string.match(tostring(err), "^pzlab:%d+:") then
+        -- Not a syntax error ("pzlab:<line>: ..."): creating the chunk's closure failed. Seen
+        -- after a reloadLuaFile ended in an exception with rewriteEvents left on, when a
+        -- callback of the same file has a nil prototype name (reroute NPE): every command
+        -- would fail. Reset the compiler and retry once.
+        pcall(PZLab.resetCompiler)
+        fn, err = loadstring(body, "pzlab")
+        if fn then c.out[#c.out + 1] = "[pzlab] compiler reset: event rewriting was stuck on after a failed reloadLuaFile" end
+    end
     if not fn then
         finish(c, false, nil, "compile error: " .. tostring(err))
         return

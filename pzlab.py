@@ -21,9 +21,11 @@
   wait EXPR [--timeout S] [--poll S]     poll a Lua expression until truthy
   drag-row SRC ROW DST [--mod KEY]...    drag an inventory-pane row onto another pane (handles)
   key NAME | keydown NAME | keyup NAME | chord NAME... | type TEXT
-  log [--errors] [--all] [--tail N] [--grep RE] | mark
+  log [--errors | --exceptions] [--all] [--tail N] [--grep RE] | mark
   window [--x X --y Y] [--back]
   reload FILE                      hot-reload a mod Lua file by its repo path
+  load-lua NAME (SRC | --code CODE) [--hot | --boot] | load-lua --clear
+                                   run Lua source as file NAME through the engine's file loader
   run SCRIPT [ARGS...]             run a Python script with `lab` predefined
 """
 
@@ -164,6 +166,8 @@ def main(argv=None):
 
     p = sub.add_parser("log")
     p.add_argument("--errors", action="store_true")
+    p.add_argument("--exceptions", action="store_true",
+                   help="engine-logged exceptions as JSON, one per 'Exception thrown' block")
     p.add_argument("--all", action="store_true", help="whole log instead of since the last mark")
     p.add_argument("--tail", type=int)
     p.add_argument("--grep")
@@ -177,6 +181,14 @@ def main(argv=None):
 
     p = sub.add_parser("reload")
     p.add_argument("file")
+    p = sub.add_parser("load-lua", help="run Lua source as a file through the engine's file loader")
+    p.add_argument("name", nargs="?", help="file name in the lab's Lua scratch folder, e.g. probe.lua")
+    p.add_argument("src", nargs="?", help="file holding the source")
+    p.add_argument("--code", help="the source itself")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--hot", action="store_true", help="reloadLuaFile even on the first load")
+    mode.add_argument("--boot", action="store_true", help="load like the engine's boot-time load")
+    p.add_argument("--clear", action="store_true", help="delete the scratch files (and load nothing)")
 
     p = sub.add_parser("run")
     p.add_argument("script")
@@ -280,6 +292,12 @@ def main(argv=None):
             emit({"ok": True})
         elif args.cmd == "log":
             since = 0 if args.all else None
+            if args.exceptions:
+                found = lab.log.exceptions(since)
+                if args.grep:
+                    found = [e for e in found if re.search(args.grep, json.dumps(e))]
+                emit(found[-args.tail:] if args.tail else found)
+                return 0
             lines = lab.log.errors(since, args.noise) if args.errors else lab.log.lines(since)
             if args.grep:
                 lines = [ln for ln in lines if re.search(args.grep, ln)]
@@ -292,6 +310,14 @@ def main(argv=None):
             emit({"rect": lab.place_window(args.x, args.y, args.back)})
         elif args.cmd == "reload":
             emit(lab.reload(args.file))
+        elif args.cmd == "load-lua":
+            if args.clear:
+                emit({"removed": lab.clear_lua_files()})
+            elif not args.name or (args.src is None) == (args.code is None):
+                raise ValueError("load-lua NAME needs the source: a file SRC or --code CODE")
+            else:
+                source = args.code if args.code is not None else Path(args.src).read_text(encoding="utf-8")
+                emit(lab.load_lua(args.name, source, hot=True if args.hot else False if args.boot else None))
         elif args.cmd == "run":
             sys.argv = [args.script] + args.args
             runpy.run_path(args.script, init_globals={"lab": lab}, run_name="__main__")

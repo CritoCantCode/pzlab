@@ -301,6 +301,17 @@ function PZLab.uiAt(x, y)
     return false
 end
 
+-- What would take a click at (x, y) instead of element el (table, Java element or handle):
+-- false when the front-most element there (uiAt) is el's own top-level window; otherwise
+-- uiAt's description of the element in front, or { type = "world" } when no UI takes the
+-- click there.
+function PZLab.coveredBy(el, x, y)
+    local at = PZLab.uiAt(x, y)
+    if not at then return { type = "world" } end
+    if at.handle == PZLab.handle(PZLab.uiRoot(PZLab.uiElement(el))) then return false end
+    return at
+end
+
 -- Class checks first: in -debug with "Break On Error" on, even an error caught by pcall halts
 -- all Lua in the debugger, so probes here must never raise.
 local function isTextEntry(j)

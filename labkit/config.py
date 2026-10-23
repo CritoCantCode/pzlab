@@ -89,6 +89,11 @@ class Config:
         return self.profile_dir / "Lua" / "pzlab"
 
     @property
+    def lua_scratch_dir(self):
+        """Lua files the lab runs through the engine's file loader (Lab.load_lua)."""
+        return self.profile_dir / "lua-scratch"
+
+    @property
     def console_log(self):
         return self.profile_dir / "console.txt"
 

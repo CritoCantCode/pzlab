@@ -86,6 +86,23 @@ for label, container, full_type in (("floor", "ISInventoryPage.GetFloorContainer
     if not rows:
         check("drag from %s" % label, False, "no %s row in the loot pane" % full_type)
         continue
+    if label == "floor":
+        # A window in front of the drop point or the row: drag_row refuses and names it.
+        lab.lua("""local w = ISCollapsableWindow:new(0, 0, 160, 90) w:initialise() w:addToUIManager()
+                   w.title = "pzlab cover" w.pin = true PZLab.coverWindow = w return true""")
+        for target, point in (("drop point", lab.lua("return PZLab.paneInfo(%d).drop" % inv)),
+                              ("row", rows[0]["point"])):
+            lab.lua("PZLab.coverWindow:setX(%d) PZLab.coverWindow:setY(%d) return true"
+                    % (point["x"] - 80, point["y"] - 45))
+            time.sleep(0.2)
+            try:
+                lab.drag_row(loot, rows[0]["index"], inv)
+                check("drag_row refuses a covered %s" % target, False, "it dragged anyway")
+            except RuntimeError as e:
+                check("drag_row refuses a covered %s and names the window" % target,
+                      '"pzlab cover"' in str(e) and lab.lua("return ISMouseDrag.dragging == nil"), str(e))
+        lab.lua("PZLab.coverWindow:removeFromUIManager() PZLab.coverWindow = nil return true")
+        time.sleep(0.2)
     done = lab.drag_row(loot, rows[0]["index"], inv)
     lab.wait_until("not PZLab.playerBusy()", timeout_s=20)
     check("drag from %s" % label, lab.lua("return PZLab.get(%d):isInPlayerInventory()" % rows[0]["handle"]),
@@ -100,7 +117,8 @@ lab.lua("PZLab.recordInput(false) return true")
 lab.input.move(5, 5)
 restored = lab.restore_layout(layout)
 KEYS = ("x", "y", "w", "h", "visible", "pinned", "collapsed")
-pages = lambda snap: [{k: w.get(k) for k in KEYS} for w in snap["windows"] if w["type"] == "ISInventoryPage"]
+# keyed by handle: restoreLayout doesn't restore z-order, and the snapshot lists windows back to front
+pages = lambda snap: {w["handle"]: {k: w.get(k) for k in KEYS} for w in snap["windows"] if w["type"] == "ISInventoryPage"}
 check("UI layout restored", pages(lab.save_layout()) == pages(layout),
       [c for c in restored["changed"] if c["type"] == "ISInventoryPage"])
 

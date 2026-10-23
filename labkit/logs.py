@@ -3,6 +3,13 @@
 import re
 
 ERROR_LINE = re.compile(r"^(ERROR|SEVERE)\b|STACK TRACE|Exception|attempted index|\[PZLab\] ERROR|Lua fail")
+# ExceptionLogger's block header, e.g. "ERROR: General      f:3510> Lua(Vanilla).onTick> Exception thrown"
+EXCEPTION_HEADER = re.compile(r"^[A-Z]+\s*:\s*\S+\s+f:(\d+)(.*?)>\s*Exception thrown\s*$")
+# "java.lang.RuntimeException: attempted index: x of non-table: null at KahluaThread.tableget(KahluaThread.java:1430)."
+EXCEPTION_LINE = re.compile(r"^(?P<cls>[\w.$]+)(?::\s?(?P<msg>.*?))?(?: at (?P<at>[^\s()]+\([^()]*\)))?\.?$", re.S)
+# "Lua(Vanilla).onTick(MyFile.lua:12)", "Lua((MOD:Some Mod)).run(File.lua:95)", "Lua.File.lua(File.lua:2)"
+LUA_FRAME = re.compile(r"^Lua(?:\((?P<origin>\(?[^()]*\)?)\))?\.(?P<fn>.+?)\((?P<file>[^()]*?):(?P<line>-?\d+)\)$")
+STACK_LINES = 8
 # Vanilla noise seen on every launch of 42.21; never caused by mods.
 NOISE = (
     "AngelCodeFont failed to load page",
@@ -63,4 +70,45 @@ class Log:
                 capturing -= 1
             else:
                 capturing = 0
+        return out
+
+    def exceptions(self, since=None):
+        """Exceptions the engine logged (ExceptionLogger), one dict per "Exception thrown" block:
+        Lua errors (also those caught by pcall, see AGENT.md), files that failed to load, Java
+        exceptions. Keys: where (the logger's caller, e.g. "Lua(Vanilla).onTick"), frame (game
+        frame), exception (Java class), message, at (Java location), function/file/line (top Lua
+        frame, when there is one), stack (up to 8 Lua frames, else the first Java frames)."""
+        out = []
+        lines = self.lines(since)
+        i = 0
+        while i < len(lines):
+            header = EXCEPTION_HEADER.match(lines[i])
+            i += 1
+            if not header:
+                continue
+            rest = header.group(2)
+            entry = {"where": rest.split(">", 1)[-1].strip() if ">" in rest else rest.strip(),
+                     "frame": int(header.group(1)), "exception": None, "message": None}
+            body = []
+            while i < len(lines) and lines[i].startswith("\t"):
+                body.append(lines[i].strip())
+                i += 1
+            if body and not body[0].startswith("Stack trace"):
+                m = EXCEPTION_LINE.match(body[0])
+                if m:
+                    entry["exception"], entry["message"] = m.group("cls"), m.group("msg")
+                    if m.group("at"):
+                        entry["at"] = m.group("at")
+                else:
+                    entry["message"] = body[0]
+            frames = body[body.index("Stack trace:") + 1:] if "Stack trace:" in body else []
+            lua = [f for f in frames if LUA_FRAME.match(f)]
+            if lua:
+                top = LUA_FRAME.match(lua[0])
+                entry.update(function=top.group("fn"), file=top.group("file"), line=int(top.group("line")))
+            entry["stack"] = (lua or frames)[:STACK_LINES]
+            causes = [b for b in body if b.startswith("Caused by:")]
+            if causes:
+                entry["causes"] = causes
+            out.append(entry)
         return out

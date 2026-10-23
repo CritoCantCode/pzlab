@@ -1,7 +1,6 @@
 """Prepares the lab profile (the game's -cachedir): options, mod links, active mods,
 autostart request. Everything written here stays inside the profile directory."""
 
-import json
 import os
 import shutil
 from pathlib import Path
@@ -120,6 +119,52 @@ def write_active_mods(cfg, enabled):
     return ids
 
 
+def lua_string(text):
+    """A Lua expression for the string. Kahlua's compiler turns non-ASCII characters in string
+    literals into U+FFFD (even written as decimal escapes), but string.char takes UTF-16 code
+    units, so those characters become string.char(...) pieces: ("J" .. string.char(252) .. "rgen")."""
+    parts, run, units = [], [], []
+    for ch in text:
+        if ord(ch) < 128:
+            if units:
+                parts.append("string.char(%s)" % ", ".join(units))
+                units = []
+            if ch == "\\":
+                run.append("\\\\")
+            elif ch == '"':
+                run.append('\\"')
+            elif ch == "\n":
+                run.append("\\n")
+            elif ch == "\r":
+                run.append("\\r")
+            elif ord(ch) < 32 or ord(ch) == 127:
+                run.append("\\%03d" % ord(ch))
+            else:
+                run.append(ch)
+        else:
+            if run:
+                parts.append('"%s"' % "".join(run))
+                run = []
+            data = ch.encode("utf-16-le")
+            units += [str(int.from_bytes(data[i:i + 2], "little")) for i in range(0, len(data), 2)]
+    if units:
+        parts.append("string.char(%s)" % ", ".join(units))
+    if run or not parts:
+        parts.append('"%s"' % "".join(run))
+    return parts[0] if len(parts) == 1 else "(" + " .. ".join(parts) + ")"
+
+
+def lua_long_string(text):
+    """A Lua long-bracket literal ([==[ ... ]==]) holding text verbatim, no escaping: for Lua
+    source passed through the bridge. The newline after the opening bracket is dropped by Lua."""
+    level = 0
+    while True:
+        close = "]" + "=" * level + "]"
+        if (text + close).find(close) == len(text):
+            return "[" + "=" * level + "[\n" + text + close
+        level += 1
+
+
 def to_lua(value):
     if value is None:
         return "nil"
@@ -128,11 +173,11 @@ def to_lua(value):
     if isinstance(value, (int, float)):
         return repr(value)
     if isinstance(value, str):
-        return json.dumps(value)  # JSON string escapes are valid Lua escapes for this use
+        return lua_string(value)
     if isinstance(value, (list, tuple)):
         return "{" + ", ".join(to_lua(v) for v in value) + "}"
     if isinstance(value, dict):
-        return "{" + ", ".join("[%s] = %s" % (json.dumps(str(k)), to_lua(v)) for k, v in value.items()) + "}"
+        return "{" + ", ".join("[%s] = %s" % (lua_string(str(k)), to_lua(v)) for k, v in value.items()) + "}"
     raise TypeError("cannot convert %r to Lua" % (value,))
 
 
@@ -158,6 +203,16 @@ def clear_runtime_files(cfg):
                 path.unlink()
             except FileNotFoundError:
                 pass
+
+
+def clear_lua_scratch(cfg):
+    """Deletes the Lua files of Lab.load_lua (<profile>/lua-scratch/); returns how many."""
+    root = cfg.lua_scratch_dir
+    if not root.exists() or cfg.profile_dir not in root.resolve().parents:
+        return 0
+    count = sum(1 for p in root.rglob("*") if p.is_file())
+    shutil.rmtree(root, ignore_errors=True)
+    return count
 
 
 def prune_saves(cfg, keep):
