@@ -1,11 +1,11 @@
 """Smoke test for UI state and recovery: uiState, contextMenus, closeContextMenus,
-closePauseMenu, ensurePlayable, setSpeed, mouseOverUI and text focus.
+closePauseMenu, ensurePlayable, setSpeed, mouseOverUI, pickBlockedBy and text focus.
 
 Opens a world context menu on a floor tile next to the player, closes it the vanilla way, sends
 Escape with nothing open (that opens the pause menu and pauses the game), recovers with
 ensure_playable and proves world input works again with another right-click. Then checks
-mouseOverUI over an inventory window and over the world, and text focus with a throwaway
-ISTextBox this script creates and destroys itself.
+mouseOverUI and pickBlockedBy over an inventory window, over the world and over a click-through
+panel, and text focus with a throwaway ISTextBox this script creates and destroys itself.
 
 Run: python pzlab.py run scripts/probe_ui_state.py
 Keep the real mouse cursor off the game window (see AGENT.md traps)."""
@@ -97,13 +97,29 @@ time.sleep(0.3)
 drop = next(p for p in lab.inventory_panes() if p["handle"] == inv)["drop"]
 lab.input.move(drop["x"], drop["y"])
 time.sleep(0.2)
-over = lab.ui_state()["mouseOverUI"]
+state = lab.ui_state()
+over, blocked = state["mouseOverUI"], state["pickBlockedBy"]
 check("mouseOverUI over the inventory window", over and over["type"] == "ISInventoryPage", over)
+check("pickBlockedBy over the inventory window (not click-through)",
+      blocked and blocked["type"] == "ISInventoryPage" and blocked["clickThrough"] is False, blocked)
 p = lab.lua("return PZLab.toScreen(PZLab.player():getX(), PZLab.player():getY() + 1, PZLab.player():getZ())")
 lab.input.move(p["x"], p["y"])
 time.sleep(0.2)
-over = lab.ui_state()["mouseOverUI"]
-check("mouseOverUI false over the world", over is False, over)
+state = lab.ui_state()
+check("mouseOverUI false over the world", state["mouseOverUI"] is False, state["mouseOverUI"])
+check("pickBlockedBy false over the world", state["pickBlockedBy"] is False, state["pickBlockedBy"])
+# A click-through panel (setWantMouseEvents(false)) under the mouse: clicks reach the world, but
+# the engine picks no world object there.
+lab.lua("""local panel = ISPanel:new(%d, %d, 40, 40) panel:initialise() panel:setWantMouseEvents(false)
+    panel:addToUIManager() PZLab.probePanel = panel return true""" % (p["x"] - 20, p["y"] - 20))
+time.sleep(0.2)
+state = lab.ui_state()
+picked = lab.lua("return UIManager.getLastPicked() ~= nil")
+lab.lua("PZLab.probePanel:removeFromUIManager() PZLab.probePanel = nil return true")
+check("click-through panel: mouseOverUI false, pickBlockedBy names it, no world pick",
+      state["mouseOverUI"] is False and (state["pickBlockedBy"] or {}).get("type") == "ISPanel"
+      and state["pickBlockedBy"]["clickThrough"] is True and picked is False,
+      (state["mouseOverUI"], state["pickBlockedBy"], picked))
 
 # Text focus and modal dialogs (a dialog this script owns).
 lab.lua("""local box = ISTextBox:new(400, 250, 320, 160, "pzlab probe", "text", nil, nil, 0)

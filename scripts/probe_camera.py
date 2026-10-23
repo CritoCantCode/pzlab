@@ -89,7 +89,7 @@ with lab.ui_layout():
     check("covered aim points skipped and reported",
           any(p["ui"] == "ISInventoryPage" for p in report["covered"]) and report["tried"] == 0, report)
     check("no hover claimed under the window",
-          point is None or not lab.lua("return PZLab.uiAt(%d, %d)" % (point["x"], point["y"])), point)
+          point is None or not lab.lua("return PZLab.pickBlockedBy(%d, %d)" % (point["x"], point["y"])), point)
     lab.input.move(5, 5)
     check("isHovered false under UI, true with allowUI", lab.lua(
         "local b = PZLab.get(%d) return { PZLab.isHovered(b, %d, %d), PZLab.isHovered(b, %d, %d, true) }"

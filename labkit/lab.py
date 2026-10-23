@@ -334,21 +334,23 @@ class Lab:
         'PZLab.square(6119,5472,0):getObjects():get(2)' or 'PZLab.get(3)') or a handle id.
         Works for tile objects, floor items, corpses and vehicles: tries PZLab.aimPoints until
         PZLab.isHovered confirms the engine's own picker resolves the mouse to the object.
-        Candidates under visible UI (a window that would take the mouse there) are skipped, as a
-        real cursor there is over the window and the engine doesn't update its world pick;
-        allow_ui=True tries them anyway (only picker checks, corpses and vehicles, can pass).
-        Returns the point {x, y} (plus "covered": the skipped points, when there were any), or
-        None. The full report is kept in self.last_hover:
-        {point, candidates, tried, covered: [{x, y, ui}]}."""
+        Candidates under visible UI are skipped (PZLab.pickBlockedBy): the engine picks no world
+        object while the cursor is over any visible top-level element, including click-through
+        ones that let clicks reach the world (clickThrough: True); allow_ui=True tries them
+        anyway (only picker checks, corpses and vehicles, can pass). Returns the point {x, y}
+        (plus "covered": the skipped points, when there were any), or None. The full report is
+        kept in self.last_hover: {point, candidates, tried, covered: [{x, y, ui, clickThrough}]}."""
         if isinstance(obj_expr, int):
             obj_expr = "PZLab.get(%d)" % obj_expr
         points = self.lua("PZLab.target = %s return PZLab.aimPoints(PZLab.target, %d)" % (obj_expr, max_points))
-        report = {"point": None, "candidates": len(points or []), "tried": 0, "covered": []}
+        points = points or []
+        covered = [] if allow_ui else [{"x": round(p["x"]), "y": round(p["y"]), "ui": p["ui"],
+                                        "clickThrough": bool(p.get("clickThrough"))} for p in points if p.get("ui")]
+        report = {"point": None, "candidates": len(points), "tried": 0, "covered": covered}
         self.last_hover = report
         check = "return PZLab.isHovered(PZLab.target, nil, nil, %s)" % ("true" if allow_ui else "false")
-        for p in points or []:
+        for p in points:
             if p.get("ui") and not allow_ui:
-                report["covered"].append({"x": round(p["x"]), "y": round(p["y"]), "ui": p["ui"]})
                 continue
             report["tried"] += 1
             self.input.move(p["x"], p["y"])
@@ -381,8 +383,10 @@ class Lab:
 
     def ui_state(self):
         """PZLab.uiState(): pauseMenu, contextMenus (count), modals, speed, paused, mouse,
-        mouseOverUI, focus (text entry), drag, escape (what Escape would do now), problems
-        (empty when world input behaves normally) and playable."""
+        mouseOverUI (what a click at the mouse would hit), pickBlockedBy (the element that keeps
+        the world from being picked at the mouse, click-through ones included), focus (text
+        entry), drag, escape (what Escape would do now), problems (empty when world input
+        behaves normally) and playable."""
         return _ui_lists(self.lua("return PZLab.uiState()"))
 
     def ensure_playable(self, speed=1):
@@ -452,6 +456,9 @@ class Lab:
             text += ' "%s"' % (d.get("title") or d.get("name"))
         if d.get("handle") is not None:
             text += " (handle %s)" % d["handle"]
+        child = d.get("child")
+        if child:
+            text += ", its child %s (handle %s)" % (child.get("type") or "?", child.get("handle"))
         return text + (", capturing the mouse" if d.get("capture") else "")
 
     def drag_row(self, src_pane, row_index, dst_pane, modifiers=(), steps=10, settle_s=0.15, phase_timeout_s=2):

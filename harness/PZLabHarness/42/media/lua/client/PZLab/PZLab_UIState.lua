@@ -269,33 +269,107 @@ end
 -- Mouse and keyboard targets
 ---------------------------------------------------------------------------------------------
 
+-- Two questions about UI at a screen point, which the engine answers differently:
+--   uiAt          where a click goes (UIManager.updateMouseButtons): an element capturing the
+--                 mouse, or the front-most one under the point whose subtree consumes the press
+--                 there (pressTakenBy); otherwise the press reaches the world.
+--   pickBlockedBy whether the world can be picked there (UIManager.updateTooltip, which sets
+--                 getLastPicked: hover, object tooltip): any visible top-level element under the
+--                 point blocks it, whatever it and its children do with mouse events; capture
+--                 doesn't matter. (World clicks use the context pick, getPicked(), which an
+--                 element that doesn't consume the mouse move leaves updating.)
+-- Both find top-level elements with the element's own hit test (UIElementInterface.
+-- isOverElement: UIElement = its rectangle, children not included; AtomUI = its box plus child
+-- nodes outside it unless isStencil), clipped to maxDrawHeight (how vanilla collapses windows),
+-- and skip the object tooltip (UIManager.getToolTip()): the engine ignores it for picking, and it
+-- follows the cursor at +24 px, so it is never under the point the mouse is at. Coordinates are
+-- floored like mouse positions.
+
+-- Whether visible top-level element j is under (x, y) for the engine's hit tests.
+local function isUnder(j, x, y)
+    local maxH = j:getMaxDrawHeight()
+    if maxH ~= nil and maxH ~= -1 then
+        local ex, ey = j:getX(), j:getY()
+        return x >= ex and y >= ey and x < ex + j:getWidth() and y < ey + math.min(j:getHeight(), maxH)
+    end
+    return j:isOverElement(x, y) == true
+end
+
+-- The element that consumes a press at (x, y) inside UIElement j: j itself, a descendant, or nil
+-- when the press goes on to the world. Follows UIElement.onMouseDown: front to back, a visible
+-- child holding the point (the engine tests x > left and y > top, strictly) or capturing the
+-- mouse is asked first, and the press is consumed if that child's subtree consumes it; otherwise
+-- j's Lua onMouseDown decides: true consumes, false doesn't, nil (vanilla ISPanel returns
+-- isWantMouseEvents()) falls back to consumeMouseEvents. Lua handlers can't be called from here
+-- without side effects, so this assumes each returns nil or that flag. Every handler on the way
+-- is called either way: a click-through element still gets onMouseDown.
+local function pressTakenBy(j, x, y)
+    local controls = j:getControls()
+    for i = controls:size() - 1, 0, -1 do
+        local c = controls:get(i)
+        if c:isVisible() then
+            local cx, cy = c:getAbsoluteX(), c:getAbsoluteY()
+            if c:isCapture() or (x > cx and y > cy and x < cx + c:getWidth() and y < cy + c:getHeight()) then
+                local taker = pressTakenBy(c, x, y)
+                if taker then return taker end
+            end
+        end
+    end
+    if j:isConsumeMouseEvents() then return j end
+    return nil
+end
+
+-- For a visible top-level element j under (x, y): the element that consumes a press there, or
+-- nil. AtomUI elements (no getControls / isConsumeMouseEvents) are assumed to consume it; the
+-- engine actually asks them (AtomUI.onConsumeMouseButtonDown: consumed only when an enabled node
+-- under the point has a Lua onMouseButtonDown that returns true).
+local function topTakesPress(j, x, y)
+    if not instanceof(j, "UIElement") then return j end
+    return pressTakenBy(j, x, y)
+end
+
 -- The front-most visible top-level element that would take a mouse click at (x, y) (default:
--- the mouse) instead of the world, following UIManager.updateMouseButtons / isOverElement: an
--- element capturing the mouse, or one whose rectangle (clipped to maxDrawHeight, how vanilla
--- collapses windows) holds the point and that consumes mouse events. Returns
--- { type, title, name, handle, capture } or false.
+-- the mouse) instead of the world, following UIManager.updateMouseButtons: an element capturing
+-- the mouse, or one under the point whose subtree consumes the press (pressTakenBy). Returns
+-- { type, title, name, handle, capture[, child = {type, title, name, handle}] } or false;
+-- child = the descendant that consumes the press, when it isn't the top-level element itself
+-- (e.g. a consuming child of a click-through panel).
 function PZLab.uiAt(x, y)
-    x, y = x or getMouseX(), y or getMouseY()
+    x, y = math.floor(x or getMouseX()), math.floor(y or getMouseY())
+    local tooltip = UIManager.getToolTip()
     local list = UIManager.getUI()
     for i = list:size() - 1, 0, -1 do
         local j = list:get(i)
-        if j:isVisible() then
+        if j:isVisible() and j ~= tooltip then
             local capture = j:isCapture() == true
-            local over = capture
-            if not over then
-                local ex, ey, w, h = j:getX(), j:getY(), j:getWidth(), j:getHeight()
-                local maxH = j:getMaxDrawHeight()
-                if maxH and maxH ~= -1 then h = math.min(h, maxH) end
-                over = x >= ex and y >= ey and x < ex + w and y < ey + h
+            local taker = (capture and j) or (isUnder(j, x, y) and topTakesPress(j, x, y))
+            if taker then
+                local d = describe(tableOf(j), j)
+                d.capture = capture
+                if taker ~= j then d.child = describe(tableOf(taker), taker) end
+                return d
             end
-            if over then
-                -- isConsumeMouseEvents exists on UIElement only (not on AtomUI elements)
-                if capture or not instanceof(j, "UIElement") or j:isConsumeMouseEvents() then
-                    local d = describe(tableOf(j), j)
-                    d.capture = capture
-                    return d
-                end
-            end
+        end
+    end
+    return false
+end
+
+-- The front-most visible top-level element that stops the engine picking the world at (x, y)
+-- (default: the mouse), following UIManager.updateTooltip: while the mouse is over any visible
+-- top-level element, getLastPicked() is nil, so nothing there is hovered or gets an object
+-- tooltip. Whether the element or its children consume mouse events doesn't matter. Returns
+-- { type, title, name, handle, clickThrough } or false; clickThrough = a press at the point
+-- passes through this element and its children (pressTakenBy), so uiAt may not report it.
+function PZLab.pickBlockedBy(x, y)
+    x, y = math.floor(x or getMouseX()), math.floor(y or getMouseY())
+    local tooltip = UIManager.getToolTip()
+    local list = UIManager.getUI()
+    for i = list:size() - 1, 0, -1 do
+        local j = list:get(i)
+        if j:isVisible() and j ~= tooltip and isUnder(j, x, y) then
+            local d = describe(tableOf(j), j)
+            d.clickThrough = not topTakesPress(j, x, y)
+            return d
         end
     end
     return false
@@ -381,7 +455,10 @@ end
 -- Snapshot of everything that decides where input goes:
 -- { ingame, mainMenu, pauseMenu, contextMenus (count, submenus included), modals (list, see
 --   PZLab.modals), speed (0 paused .. 4), multiplier (GameTime), paused (isGamePaused),
---   mouse = {x, y}, mouseOverUI (PZLab.uiAt() at the mouse: false or {type, ...}),
+--   mouse = {x, y}, mouseOverUI (PZLab.uiAt() at the mouse: what a click there would hit;
+--   false or {type, ...}), pickBlockedBy (PZLab.pickBlockedBy() at the mouse: the element that
+--   keeps the world from being picked/hovered there, click-through ones included; false or
+--   {type, ..., clickThrough}),
 --   focus (PZLab.textFocus(): false or {type, ...}), drag (false | "items" | "placement"),
 --   escape (PZLab.escapeAction()), problems = { ... }, playable = (#problems == 0) }
 -- problems lists what would make world input misbehave: "notInGame", "pauseMenu", "paused",
@@ -399,6 +476,7 @@ function PZLab.uiState()
         paused = isGamePaused() == true,
         mouse = { x = getMouseX(), y = getMouseY() },
         mouseOverUI = PZLab.uiAt(),
+        pickBlockedBy = PZLab.pickBlockedBy(),
         focus = PZLab.textFocus(),
         drag = false,
         escape = PZLab.escapeAction(),

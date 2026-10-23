@@ -173,10 +173,11 @@ local function pickerAimPoints(obj, pick, halfW, halfH, step, maxPoints, spacing
     return out
 end
 
--- The visible UI element that would take the mouse at (x, y) instead of the world, or false
--- (PZLab.uiAt, defined in PZLab_UIState, which loads after this file).
-local function uiOver(x, y)
-    return PZLab.uiAt ~= nil and PZLab.uiAt(x, y) or false
+-- The visible UI element at (x, y) that keeps the engine from picking the world there, click-
+-- through elements included, or false (PZLab.pickBlockedBy, defined in PZLab_UIState, which
+-- loads after this file). Clicks are a different question: PZLab.uiAt.
+local function pickBlocker(x, y)
+    return PZLab.pickBlockedBy ~= nil and PZLab.pickBlockedBy(x, y) or false
 end
 
 -- Screen points where moving the mouse should make the engine pick `obj`, best first; callers
@@ -186,8 +187,9 @@ end
 --   floor items: the item's floor position first (B42 draws them as 3D models, which the
 --                object picker never returns; see PZLab.isHovered), then sprite pixels
 -- Only points on the screen. Up to maxPoints points clear of UI come first; then up to
--- maxPoints points covered by visible UI (PZLab.uiAt), each with ui = <that element's type>: a
--- real cursor there is over the window, and the engine doesn't update its world pick while it is.
+-- maxPoints points covered by visible UI (PZLab.pickBlockedBy), each with ui = <that element's
+-- type> and clickThrough (true when that element lets clicks through): the engine picks no world
+-- object while the cursor is over a visible top-level element, consuming mouse events or not.
 function PZLab.aimPoints(obj, maxPoints, spacing)
     maxPoints, spacing = maxPoints or 12, spacing or 10
     local wanted = maxPoints * 4 -- extra candidates, so UI covering part of the object still leaves some
@@ -205,9 +207,9 @@ function PZLab.aimPoints(obj, maxPoints, spacing)
     end
     local clear, covered = {}, {}
     for _, p in ipairs(candidates) do
-        local ui = uiOver(p.x, p.y)
+        local ui = pickBlocker(p.x, p.y)
         if ui then
-            p.ui = ui.type
+            p.ui, p.clickThrough = ui.type, ui.clickThrough
             if #covered < maxPoints then covered[#covered + 1] = p end
         elseif #clear < maxPoints then
             clear[#clear + 1] = p
@@ -223,13 +225,13 @@ end
 --     floor items as 3D models the object picker never returns; the world context menu
 --     collects floor items from the picked square, ISWorldObjectContextMenuLogic.fetch);
 --   everything else: UIManager.getLastPicked() (mouse only).
--- False when visible UI covers the point (PZLab.uiAt), unless allowUI: the cursor would be over
--- that window, and the engine doesn't update getLastPicked while the mouse is over UI.
+-- False when visible UI covers the point (PZLab.pickBlockedBy: click-through elements too),
+-- unless allowUI: getLastPicked() is nil while the cursor is over any visible top-level element.
 function PZLab.isHovered(obj, x, y, allowUI)
     if type(obj) == "number" then obj = PZLab.get(obj) end
     if obj == nil then return false end
     x, y = math.floor(x or getMouseX()), math.floor(y or getMouseY())
-    if not allowUI and uiOver(x, y) then return false end
+    if not allowUI and pickBlocker(x, y) then return false end
     if instanceof(obj, "IsoDeadBody") then return pickCorpse(x, y) == obj end
     if instanceof(obj, "BaseVehicle") then return pickVehicle(x, y) == obj end
     local picked = UIManager.getLastPicked()

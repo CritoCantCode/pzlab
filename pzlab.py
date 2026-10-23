@@ -129,7 +129,7 @@ def main(argv=None):
     p.add_argument("--mod", action="append", default=[], help="modifier key held during the drag (repeatable)")
     p = sub.add_parser("hover", help="move the mouse onto a world object until the engine picks it")
     p.add_argument("obj", help="Lua expression for the object, or a handle id")
-    p.add_argument("--allow-ui", action="store_true", help="also try points covered by UI windows")
+    p.add_argument("--allow-ui", action="store_true", help="also try points covered by UI (click-through elements included)")
     p = sub.add_parser("zoom", help="show the camera zoom and levels, or set the nearest level")
     p.add_argument("z", nargs="?", type=float)
     p = sub.add_parser("goto", help="teleport to a catalogue location or X Y [Z], wait until loaded")
