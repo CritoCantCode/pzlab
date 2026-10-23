@@ -1,0 +1,79 @@
+{
+  "_about": "Test locations on the vanilla map (world 'Muldraugh, KY'). Coordinates are tiles; whole numbers = tile centre; the point is a free floor square to stand on. 'containers' counts tile objects with containers per floor inside 'area' (the building's metagrid bounds, or the open area) and is what scripts/probe_locations.py re-checks; furniture is map data, the items inside are random per world. Only add an entry after standing there and confirming its contents in game (PZLab.findObjects or a scan + a screenshot), and record the game version in 'verified'.",
+  "spawn-house": {
+    "x": 6119, "y": 5474, "z": 0,
+    "map": "Muldraugh, KY", "verified": "42.21.0",
+    "about": "Riverside single-storey house; lab.json's default world start. Stands in the living room, kitchen to the east.",
+    "area": [6112, 5472, 6125, 5484],
+    "rooms": {"z0": ["livingroom", "kitchen", "hall", "bedroom", "kidsbedroom", "closet", "bathroom", "office"]},
+    "containers": {"z0": 34},
+    "contents": {
+      "z0": "kitchen: 4 counters, 5 overhead cabinets, stove, fridge (fridge + freezer), microwave; 4 dressers, 4 wardrobes, 2 shelves, 2 dishes cabinets, 2 filing cabinets, 2 desks, 2 bins, side table, small box, metal shelves; propane barbecue outside at 6125,5481"
+    }
+  },
+  "two-storey-house": {
+    "x": 6079, "y": 5427, "z": 0,
+    "map": "Muldraugh, KY", "verified": "42.21.0",
+    "about": "Riverside two-storey house, ground floor: stands in the kitchen. Stairs up at 6080,5429-5431; upstairs is 'two-storey-house-upstairs'.",
+    "area": [6077, 5421, 6087, 5434],
+    "rooms": {"z0": ["kitchen", "diningroom", "livingroom", "laundry", "closet", "bathroom"],
+              "z1": ["hall", "bedroom", "kidsbedroom", "kidsbedroom", "bathroom", "bathroom", "closet"]},
+    "containers": {"z0": 22, "z1": 16},
+    "contents": {
+      "z0": "kitchen: 8 counters, stove, fridge (fridge + freezer), microwave, dishwasher, bin; laundry: washer, 2 dryers, metal shelves; closet: metal shelves, small box; living room: desk, dresser; barbecue outside at 6077,5421",
+      "z1": "hall: 2 dishes cabinets, shelves; bedroom: 2 wardrobes, side table; kids bedrooms: dresser, 2 side tables, shelves; bathrooms: counter, medicine cabinet; closet: metal shelves, small box, 2 cardboard boxes"
+    }
+  },
+  "two-storey-house-upstairs": {
+    "x": 6081, "y": 5427, "z": 1,
+    "map": "Muldraugh, KY", "verified": "42.21.0",
+    "about": "Upstairs hall of 'two-storey-house'. From here lab.hover reached 10-12 of the 16 upstairs containers in two runs (the rest are behind walls).",
+    "area": [6077, 5421, 6087, 5434],
+    "containers": {"z0": 22, "z1": 16},
+    "contents": {"z1": "see two-storey-house"}
+  },
+  "grocery": {
+    "x": 6136, "y": 5370, "z": 0,
+    "map": "Muldraugh, KY", "verified": "42.21.0",
+    "about": "Riverside grocery, between the shelf rows; the parking lot is just east ('parking-lot').",
+    "area": [6130, 5365, 6143, 5375],
+    "rooms": {"z0": ["grocery", "grocerystorage", "bathroom"]},
+    "containers": {"z0": 44},
+    "contents": {
+      "z0": "17 shelves, 2 magazine shelves, 3 grocer stands, 3 bakery display cases, 4 fridges + 2 freezers, 5 counters, cash register, 3 bins, small box; storage room: 2 metal shelves, 2 crates; newspaper box outside"
+    }
+  },
+  "parking-lot": {
+    "x": 6148, "y": 5384, "z": 0,
+    "map": "Muldraugh, KY", "verified": "42.21.0",
+    "about": "Open asphalt lot east of the grocery: 'area' (12 x 16 tiles) is clear ground (PZLab.findOpenArea). A car (6145,5379 E), a pickup (6151,5381 S) and a van (6145,5388 E) spawned there were all in view and hovered at zoom 1.",
+    "area": [6142, 5376, 6153, 5391],
+    "containers": {"z0": 0},
+    "contents": {"z0": "nothing: open ground for vehicles, corpses and floor items"}
+  },
+  "gigamart": {
+    "x": 6505, "y": 5345, "z": 0,
+    "map": "Muldraugh, KY", "verified": "42.21.0",
+    "about": "Riverside Gigamart, a large supermarket about 390 tiles east of the spawn; stands between shelf rows. Offices upstairs.",
+    "area": [6482, 5331, 6522, 5359],
+    "rooms": {"z0": ["gigamart", "bakery", "butcher", "grocerystorage", "bathroom", "janitor", "hallway"],
+              "z1": ["office", "breakroom", "lockerroom", "bathroom", "hallway"]},
+    "containers": {"z0": 227, "z1": 35},
+    "contents": {
+      "z0": "62 shelves, 27 metal shelves, 33 grocer stands, 8 magazine shelves, 28 fridge + 27 freezer compartments, 9 butcher and 4 bakery display cases, 12 counters, 4 stoves, 4 cash registers, 6 crates, 7 small boxes, 11 bins, 2 dumpsters",
+      "z1": "6 filing cabinets, 3 desks, 4 lockers, 5 counters, fridge + freezer, stove, microwave, 2 vending machines, 4 cardboard boxes, 7 bins"
+    }
+  },
+  "warehouse": {
+    "x": 5614, "y": 5975, "z": 0,
+    "map": "Muldraugh, KY", "verified": "42.21.0",
+    "about": "Warehouse hall full of crates about 710 tiles from the spawn. Its interior is unlit (light level 0 at 14:00): screenshots there are black, though picking and lab.hover work (7 of 11 nearby crates hovered). The office at 5605,5990 is lit.",
+    "area": [5600, 5957, 5629, 5993],
+    "rooms": {"z0": ["warehouse", "hallway", "janitor", "bathroom", "office", "changeroom"], "z1": ["warehouse"], "z2": ["warehouse"]},
+    "containers": {"z0": 226, "z1": 3},
+    "contents": {
+      "z0": "194 crates, 10 metal shelves, 6 lockers, 4 filing cabinets, 2 desks, 2 counters, 6 bins, soda machine, medicine cabinet",
+      "z1": "2 metal shelves, bin"
+    }
+  }
+}

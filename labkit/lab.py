@@ -1,16 +1,37 @@
 """Lab facade: set up, start, drive, inspect and stop a Project Zomboid instance."""
 
+import contextlib
 import json
 import os
+import re
 import shutil
 import time
 from pathlib import Path
 
-from . import detect, imaging, process, profile, win32
+from . import detect, imaging, locations, process, profile, win32
 from .bridge import Bridge
 from .config import LAB_ROOT, Config
 from .inputs import Input
 from .logs import Log
+
+
+class NotPlayable(RuntimeError):
+    """The game is not in a state where world input behaves normally (see Lab.require_playable)."""
+
+    def __init__(self, problems, state):
+        super().__init__("UI not playable: %s (escape would: %s)" % (", ".join(problems), state.get("escape")))
+        self.problems = problems
+        self.state = state
+        self.result = state
+
+
+def _ui_lists(state):
+    """An empty Lua table arrives as {}; make the list-valued uiState fields lists again."""
+    if isinstance(state, dict):
+        for key in ("modals", "problems"):
+            if state.get(key) == {}:
+                state[key] = []
+    return state
 
 
 class Lab:
@@ -19,6 +40,7 @@ class Lab:
         self.bridge = Bridge(self.cfg.lua_dir)
         self.log = Log(self.cfg)
         self._input = None
+        self.last_hover = None
 
     # Lifecycle ------------------------------------------------------------------------------
 
@@ -78,6 +100,7 @@ class Lab:
         profile.ensure_dirs(cfg)
         profile.write_options(cfg)
         profile.link_mods(cfg)
+        profile.write_locations(cfg)
         ids = profile.write_active_mods(cfg, [profile.mod_id(cfg, n) if n in cfg.mods else n for n in names])
         return {"profile": str(cfg.profile_dir), "game_dir": str(cfg.game_dir), "active_mods": ids}
 
@@ -126,7 +149,7 @@ class Lab:
             state = self.bridge.state()
             if state and state["age_s"] < 3 and state["state"] == target:
                 time.sleep(settle_s)
-                return self.bridge.state()
+                return self.bridge.state() or state
             if (target == "ingame" and log_offset is not None and time.time() >= next_click
                     and any("game loading took" in line for line in self.log.lines(since=log_offset))):
                 next_click = time.time() + 2
@@ -198,9 +221,7 @@ class Lab:
 
     def send(self, code):
         """Fire-and-forget command (no reply expected, e.g. quitting)."""
-        tmp = self.cfg.lua_dir / "cmd.tmp"
-        tmp.write_text("PZLAB %d 60000\n%s" % (time.time_ns(), code), encoding="utf-8")
-        os.replace(tmp, self.cfg.lua_dir / "cmd.txt")
+        return self.bridge.send(code)
 
     def reload(self, source_file):
         """Hot-reloads a mod Lua file given its source path, resolved through the profile's mod links."""
@@ -242,19 +263,261 @@ class Lab:
             self._input = Input(hwnd)
         return self._input
 
-    def hover(self, obj_expr, max_points=12, settle_s=0.12):
+    def hover(self, obj_expr, max_points=12, settle_s=0.12, allow_ui=False):
         """Moves the mouse onto a world object so the engine itself picks it.
 
-        obj_expr is a Lua expression evaluating to the IsoObject (e.g.
-        'PZLab.square(6119,5472,0):getObjects():get(2)'). Tries points on the sprite's opaque
-        pixels until UIManager.getLastPicked() is that object. Returns the point, or None."""
+        obj_expr is a Lua expression evaluating to the object (e.g.
+        'PZLab.square(6119,5472,0):getObjects():get(2)' or 'PZLab.get(3)') or a handle id.
+        Works for tile objects, floor items, corpses and vehicles: tries PZLab.aimPoints until
+        PZLab.isHovered confirms the engine's own picker resolves the mouse to the object.
+        Candidates under visible UI (a window that would take the mouse there) are skipped, as a
+        real cursor there is over the window and the engine doesn't update its world pick;
+        allow_ui=True tries them anyway (only picker checks, corpses and vehicles, can pass).
+        Returns the point {x, y} (plus "covered": the skipped points, when there were any), or
+        None. The full report is kept in self.last_hover:
+        {point, candidates, tried, covered: [{x, y, ui}]}."""
+        if isinstance(obj_expr, int):
+            obj_expr = "PZLab.get(%d)" % obj_expr
         points = self.lua("PZLab.target = %s return PZLab.aimPoints(PZLab.target, %d)" % (obj_expr, max_points))
+        report = {"point": None, "candidates": len(points or []), "tried": 0, "covered": []}
+        self.last_hover = report
+        check = "return PZLab.isHovered(PZLab.target, nil, nil, %s)" % ("true" if allow_ui else "false")
         for p in points or []:
+            if p.get("ui") and not allow_ui:
+                report["covered"].append({"x": round(p["x"]), "y": round(p["y"]), "ui": p["ui"]})
+                continue
+            report["tried"] += 1
             self.input.move(p["x"], p["y"])
             time.sleep(settle_s)
-            if self.lua("return UIManager.getLastPicked() == PZLab.target"):
-                return {"x": round(p["x"]), "y": round(p["y"])}
+            if self.lua(check):
+                point = {"x": round(p["x"]), "y": round(p["y"])}
+                report["point"] = dict(point)
+                if report["covered"]:
+                    point["covered"] = report["covered"]
+                return point
         return None
+
+    # Waiting ----------------------------------------------------------------------------------
+
+    def wait_until(self, lua_expr, timeout_s=10, poll_s=0.1):
+        """Polls a Lua expression (or a chunk containing `return`) until it is Lua-truthy
+        (anything but nil/false; 0 and "" count as true). Returns its value; raises TimeoutError
+        with the last value. Example: lab.wait_until("not PZLab.playerBusy()")."""
+        code = lua_expr if re.search(r"\breturn\b", lua_expr) else "return " + lua_expr
+        deadline = time.time() + timeout_s
+        while True:
+            value = self.lua(code)
+            if value is not None and value is not False:
+                return value
+            if time.time() >= deadline:
+                raise TimeoutError("wait_until(%r): still %r after %ss" % (lua_expr, value, timeout_s))
+            time.sleep(poll_s)
+
+    # UI state -------------------------------------------------------------------------------
+
+    def ui_state(self):
+        """PZLab.uiState(): pauseMenu, contextMenus (count), modals, speed, paused, mouse,
+        mouseOverUI, focus (text entry), drag, escape (what Escape would do now), problems
+        (empty when world input behaves normally) and playable."""
+        return _ui_lists(self.lua("return PZLab.uiState()"))
+
+    def ensure_playable(self, speed=1):
+        """PZLab.ensurePlayable: leaves the pause menu the way its Resume item does, closes context
+        menus, takes keyboard focus off a text entry, sets game speed (0-4). Never answers modal
+        dialogs; they stay in after["problems"].
+        Returns {before, after, closed: {pauseMenu, contextMenus, textEntry}[, errors]}."""
+        result = self.lua("return PZLab.ensurePlayable({ speed = %d })" % int(speed))
+        _ui_lists(result.get("before"))
+        _ui_lists(result.get("after"))
+        return result
+
+    def close_context_menus(self):
+        """PZLab.closeContextMenus(): closes visible context menus with vanilla's own calls; returns the count."""
+        return self.lua("return PZLab.closeContextMenus()")
+
+    def close_pause_menu(self):
+        """PZLab.closePauseMenu(): True if it left the in-game pause menu, False if none was open."""
+        return self.lua("return PZLab.closePauseMenu()")
+
+    def context_menus(self):
+        """PZLab.contextMenus(): visible context menus with their options and click points."""
+        return self.lua("return PZLab.contextMenus()") or []
+
+    def require_playable(self, allow=()):
+        """Raises NotPlayable unless uiState reports no problems other than those in `allow`
+        (exact strings such as "contextMenus", or prefixes such as "modal"). Returns the state.
+        Call before acting so a stray pause menu or dialog can't silently void a test."""
+        state = self.ui_state()
+        bad = [p for p in state.get("problems", []) if p not in allow and p.split(":")[0] not in allow]
+        if bad:
+            raise NotPlayable(bad, state)
+        return state
+
+    # Inventory panes ------------------------------------------------------------------------
+
+    def inventory_panes(self):
+        """PZLab.inventoryPanes(): every visible ISInventoryPane (handle, rects, container, owner)."""
+        return self.lua("return PZLab.inventoryPanes()") or []  # an empty Lua table encodes as {}
+
+    def pane_rows(self, pane):
+        """PZLab.paneRows(pane): the on-screen rows of an inventory pane (handle id)."""
+        return self.lua("return PZLab.paneRows(%d)" % pane) or []
+
+    def _poll(self, lua_expr, timeout_s, poll_s=0.03):
+        """True once a Lua expression is truthy, False after timeout_s (never raises on timeout)."""
+        deadline = time.time() + timeout_s
+        while True:
+            value = self.lua("return " + lua_expr)
+            if value is not None and value is not False:
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(poll_s)
+
+    def drag_row(self, src_pane, row_index, dst_pane, modifiers=(), steps=10, settle_s=0.15, phase_timeout_s=2):
+        """Drags row `row_index` (PZLab.paneRows index) of inventory pane `src_pane` onto pane
+        `dst_pane` (handles) with real mouse input, holding `modifiers` throughout. Each phase
+        waits for the game to acknowledge it, so slow frames can't reorder press and moves: the
+        row is under the mouse (src.mouseOverOption), the press started vanilla's item drag
+        (ISMouseDrag.draggingFocus == src), the destination sees the mouse (isMouseOver), and the
+        drop was handled (ISMouseDrag.dragging cleared). Returns what it did, including the
+        player's action queue right after the drop; wait for the transfer with
+        lab.wait_until("not PZLab.playerBusy()")."""
+        info = self.lua("""
+            local rows, row = PZLab.paneRows(%d), nil
+            for _, r in ipairs(rows) do if r.index == %d then row = r end end
+            local visible = {}
+            for i, r in ipairs(rows) do visible[i] = r.index end
+            return { row = row, visible = visible, dst = PZLab.paneInfo(%d) }
+        """ % (src_pane, row_index, dst_pane))
+        row, dst = info.get("row"), info["dst"]
+        if not row:
+            raise ValueError("row %d of pane %d is not on screen (visible rows: %s)"
+                             % (row_index, src_pane, info.get("visible")))
+        if not dst.get("shown"):
+            raise ValueError("destination pane %d shows no list area (window collapsed or hidden?); "
+                             "for vanilla windows call PZLab.openInventoryWindows() first" % dst_pane)
+        (x1, y1), (x2, y2) = (row["point"]["x"], row["point"]["y"]), (dst["drop"]["x"], dst["drop"]["y"])
+        inp = self.input
+        src_el, dst_el = "PZLab.uiElement(%d)" % src_pane, "PZLab.uiElement(%d)" % dst_pane
+        held = inp.press_modifiers(modifiers)
+        pressed = False
+        try:
+            inp.move(x1, y1)
+            time.sleep(settle_s)
+            if not self._poll("%s.mouseOverOption == %d" % (src_el, row_index), phase_timeout_s):
+                raise RuntimeError("mouse at %s but pane %d has mouseOverOption %r, not row %d" % (
+                    (x1, y1), src_pane, self.lua("return %s.mouseOverOption" % src_el), row_index))
+            inp.down("left")
+            pressed = True
+            if not self._poll("ISMouseDrag.dragging ~= nil and ISMouseDrag.draggingFocus == %s" % src_el,
+                              phase_timeout_s):
+                raise RuntimeError("pressing row %d of pane %d did not start an item drag" % (row_index, src_pane))
+            for i in range(1, steps + 1):
+                inp.move(x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps)
+                time.sleep(inp.frame_s)
+            if not self._poll("%s:isMouseOver()" % dst_el, phase_timeout_s):
+                raise RuntimeError("destination pane %d does not see the mouse at %s" % (dst_pane, (x2, y2)))
+            time.sleep(settle_s)
+            inp.up("left")
+            pressed = False
+            if not self._poll("ISMouseDrag.dragging == nil", phase_timeout_s):
+                raise RuntimeError("the drop on pane %d was not handled (ISMouseDrag.dragging still set)" % dst_pane)
+        finally:
+            if pressed:
+                inp.up("left")
+            inp.release_modifiers(held)
+        return {"src": src_pane, "dst": dst_pane, "row": row, "from": [x1, y1], "to": [x2, y2],
+                "modifiers": list(held), "actions": self.lua("return PZLab.actionQueue()")}
+
+    def show_inventory_panes(self, player=0, pin=True, inventory=None, loot=None, timeout_s=3):
+        """PZLab.showInventoryPanes: makes the player's vanilla inventory and loot windows visible,
+        expanded and (pin=True) pinned, inside the screen and in front; inventory / loot =
+        {"x", "y", "w", "h"} also places them. Waits until both panes show their list.
+        Returns {"inventory": {window, pane, rect, info}, "loot": {...}}; info = PZLab.paneInfo."""
+        opts = {"player": player, "pin": pin}
+        if inventory:
+            opts["inventory"] = inventory
+        if loot:
+            opts["loot"] = loot
+        self.lua("return PZLab.showInventoryPanes(%s)" % profile.to_lua(opts))
+        deadline = time.time() + timeout_s
+        while True:
+            # a frame later: vanilla's update() has run and the pane geometry is final
+            result = self.lua("return PZLab.inventoryPanesOf(%d)" % player)
+            if all(result.get(k, {}).get("info", {}).get("shown") for k in ("inventory", "loot")):
+                return result
+            if time.time() >= deadline:
+                raise RuntimeError("inventory panes not shown after %ss: %s" % (timeout_s, result))
+            time.sleep(0.05)
+
+    # UI layout ------------------------------------------------------------------------------
+
+    def save_layout(self):
+        """PZLab.saveLayout(): snapshot of every top-level UI element (position, size, visible,
+        attached, pinned, collapsed). Returns it ({"id", "windows": [...]})."""
+        return self.lua("return PZLab.saveLayout()")
+
+    def restore_layout(self, snapshot, hide_added=False):
+        """PZLab.restoreLayout: puts every element of a snapshot (dict or id) back as it was.
+        hide_added=True also hides top-level elements that appeared since. Returns
+        {restored, changed: [{type, title, fields}], added: [...], missing: [...]}."""
+        snap_id = snapshot["id"] if isinstance(snapshot, dict) else int(snapshot)
+        result = self.lua("return PZLab.restoreLayout(%d, { hideAdded = %s })"
+                          % (snap_id, "true" if hide_added else "false"))
+        for key in ("changed", "added", "missing"):
+            if result.get(key) == {}:
+                result[key] = []
+        return result
+
+    @contextlib.contextmanager
+    def ui_layout(self, hide_added=False):
+        """Context manager: snapshot the UI layout, run the block, restore it (also on errors).
+        with lab.ui_layout(): lab.show_inventory_panes(); ...  The snapshot is yielded."""
+        snapshot = self.save_layout()
+        try:
+            yield snapshot
+        finally:
+            self.restore_layout(snapshot, hide_added=hide_added)
+
+    # Camera and places ----------------------------------------------------------------------
+
+    def get_zoom(self):
+        """PZLab.getZoom(): the camera zoom (Core.getZoom(0); > 1 shows more world)."""
+        return self.lua("return PZLab.getZoom()")
+
+    def zoom_levels(self):
+        """PZLab.zoomLevels(): supported zoom levels, closest first."""
+        return self.lua("return PZLab.zoomLevels()")
+
+    def set_zoom(self, zoom, timeout_s=5):
+        """PZLab.setZoom: snaps to the nearest supported level, scrolls there like the mouse
+        wheel and waits until the camera has settled. Returns the final zoom."""
+        return self.lua("return PZLab.setZoom(%r, %d)" % (float(zoom), timeout_s * 1000),
+                        timeout_ms=int(timeout_s * 1000) + 2000)
+
+    def locations(self):
+        """The test-location catalogue (labkit/locations.json): name -> entry."""
+        return locations.load()
+
+    def goto(self, target, radius=10, timeout_s=30):
+        """Teleports the player to a catalogue location (name) or (x, y[, z]) and waits until the
+        area around it is loaded and the player stands there (PZLab.gotoLocation).
+        Returns {name, x, y, z, player, ms}."""
+        pos = locations.position(target)
+        spec = {"x": pos["x"], "y": pos["y"], "z": pos["z"]}
+        result = self.lua("return PZLab.gotoLocation(%s, { radius = %d, timeoutMs = %d })"
+                          % (profile.to_lua(spec), radius, timeout_s * 1000),
+                          timeout_ms=int(timeout_s * 1000) + 10000)
+        if isinstance(target, str):
+            result["name"] = target
+        return result
+
+    # Fixtures -------------------------------------------------------------------------------
+
+    def clear_fixtures(self):
+        """PZLab.clearFixtures(): removes every tracked fixture still in the world; returns the count."""
+        return self.lua("return PZLab.clearFixtures()")
 
     def place_window(self, x=None, y=None, background=None):
         opts = self.cfg["window"]
@@ -271,13 +534,16 @@ class Lab:
 
     # Screenshots ----------------------------------------------------------------------------
 
-    def screenshot(self, out=None, crop=None, scale=None, timeout_s=10):
-        """Captures the game's own frame buffer (UI included). crop=(x, y, w, h) in UI pixels."""
+    def screenshot(self, out=None, crop=None, scale=None, timeout_s=10, check=False):
+        """Captures the game's own frame buffer (UI included). crop=(x, y, w, h) in UI pixels.
+        Returns the path; with check=True returns {"path", "problems"}: uiState problems at the
+        moment of the capture (same Lua call), e.g. ["pauseMenu", "paused"]."""
         # takeScreenshot(name) writes <profile>/Screenshots/<name> verbatim, on the render thread.
         name = "pzlab_%d.png" % time.time_ns()
         found = self.cfg.screenshot_dir / name
         started = time.time()
-        self.lua("return PZLab.screenshot(%s)" % profile.to_lua(name))
+        problems = self.lua("PZLab.screenshot(%s) return %s" % (
+            profile.to_lua(name), "PZLab.uiState().problems" if check else "true"))
         while True:
             if found.exists():
                 size = found.stat().st_size
@@ -293,6 +559,8 @@ class Lab:
             found.unlink()
         else:
             shutil.move(found, dest)
+        if check:
+            return {"path": str(dest), "problems": problems or []}
         return str(dest)
 
     def os_screenshot(self, out=None, crop=None, scale=None):

@@ -136,16 +136,28 @@ def to_lua(value):
     raise TypeError("cannot convert %r to Lua" % (value,))
 
 
+def write_locations(cfg):
+    """The test-location catalogue as a Lua chunk for the harness (PZLab.locations)."""
+    from . import locations
+    (cfg.lua_dir / "locations.txt").write_text("return " + to_lua(locations.load()) + "\n", encoding="utf-8")
+
+
 def write_autostart(cfg, world):
     (cfg.lua_dir / "autostart.txt").write_text("return " + to_lua(world) + "\n", encoding="utf-8")
 
 
 def clear_runtime_files(cfg):
-    for name in ("cmd.txt", "cmd.tmp", "res.json", "state.json", "autostart.txt"):
-        try:
-            (cfg.lua_dir / name).unlink()
-        except FileNotFoundError:
-            pass
+    """Bridge files of a previous run (removed before launch, so nothing reads them meanwhile)."""
+    if not cfg.lua_dir.exists():
+        return
+    for path in cfg.lua_dir.iterdir():
+        name = path.name
+        if (name in ("cmd.txt", "cmd.tmp", "res.json", "state.json", "autostart.txt")
+                or (name.startswith("cmd-") and name.endswith((".txt", ".go")))):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def prune_saves(cfg, keep):

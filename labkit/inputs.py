@@ -76,26 +76,35 @@ class Input:
         self.buttons &= ~flag
         self._post(msg_up, self.buttons, _lparam_xy(*self.pos))
 
-    def click(self, x, y, button="left", hold_s=None, double=False):
-        self.move(x, y)
-        time.sleep(self.frame_s)
-        for _ in range(2 if double else 1):
+    def click(self, x, y, button="left", hold_s=None, double=False, modifiers=()):
+        """modifiers: key names held around the click, e.g. ("alt",) or ("ctrl", "shift")."""
+        held = self.press_modifiers(modifiers)
+        try:
+            self.move(x, y)
+            time.sleep(self.frame_s)
+            for _ in range(2 if double else 1):
+                self.down(button)
+                time.sleep(hold_s if hold_s is not None else self.frame_s * 2)
+                self.up(button)
+                time.sleep(self.frame_s)
+        finally:
+            self.release_modifiers(held)
+
+    def drag(self, x1, y1, x2, y2, button="left", steps=10, modifiers=()):
+        held = self.press_modifiers(modifiers)
+        try:
+            self.move(x1, y1)
+            time.sleep(self.frame_s)
             self.down(button)
-            time.sleep(hold_s if hold_s is not None else self.frame_s * 2)
+            time.sleep(self.frame_s * 2)
+            for i in range(1, steps + 1):
+                self.move(x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps)
+                time.sleep(self.frame_s)
+            time.sleep(self.frame_s)
             self.up(button)
             time.sleep(self.frame_s)
-
-    def drag(self, x1, y1, x2, y2, button="left", steps=10):
-        self.move(x1, y1)
-        time.sleep(self.frame_s)
-        self.down(button)
-        time.sleep(self.frame_s * 2)
-        for i in range(1, steps + 1):
-            self.move(x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps)
-            time.sleep(self.frame_s)
-        time.sleep(self.frame_s)
-        self.up(button)
-        time.sleep(self.frame_s)
+        finally:
+            self.release_modifiers(held)
 
     def wheel(self, x, y, notches):
         self.move(x, y)
@@ -123,6 +132,22 @@ class Input:
         vk, ext = self._key(name)
         lparam = 1 | (win32.scancode(vk) << 16) | ((1 if ext else 0) << 24) | (1 << 30) | (1 << 31)
         self._post(WM_KEYUP, vk, lparam)
+
+    def press_modifiers(self, modifiers):
+        """Presses each named key (a name or a sequence of names); returns them for
+        release_modifiers. The game sees them held from the next frame on."""
+        names = [modifiers] if isinstance(modifiers, str) else list(modifiers or ())
+        for name in names:
+            self._key(name)  # validate all before pressing any
+        for name in names:
+            self.key_down(name)
+            time.sleep(self.frame_s)
+        return names
+
+    def release_modifiers(self, names):
+        for name in reversed(names):
+            self.key_up(name)
+            time.sleep(self.frame_s)
 
     def tap(self, name, hold_s=None):
         self.key_down(name)

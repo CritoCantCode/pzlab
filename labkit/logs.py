@@ -13,6 +13,7 @@ NOISE = (
     "CellLoader> missing tile",
     "CraftRecipeComponentScript",
     "refusing to list",
+    "Missing tile definition",  # map data referencing *_TEST_* tiles, logged as areas load (42.21)
 )
 
 

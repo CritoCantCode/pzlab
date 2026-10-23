@@ -1,6 +1,13 @@
--- PZLab command bridge. The controller writes pzlab/cmd.txt:
+-- PZLab command bridge. For each command the controller writes pzlab/cmd-<seq>.txt:
 --   line 1: "PZLAB <seq> <timeoutMs>"
 --   rest:   a Lua chunk, run synchronously within one tick.
+-- then, once that file is closed, creates the empty flag pzlab/cmd-<seq>.go, and deletes both
+-- after the reply. The harness only lists the directory (no open) to find flags, and opens a
+-- command file once, after its flag exists and before the controller deletes it: a file the
+-- harness opens is never being written, replaced or deleted at that moment. (On Windows an open
+-- racing a delete/replace/truncate fails with a sharing violation, which getFileReader logs as
+-- "SEVERE: null java.io.FileNotFoundException" with a stack trace.) seq is a decimal number,
+-- increasing; only flags newer than the last command run are taken.
 -- The chunk's first return value goes to pzlab/res.json as
 --   {"seq", "ok", "value" | "error", "out", "frames", "ms"}.
 -- A chunk that returns PZLab.steps{...} becomes a multi-tick job (see PZLab.steps).
@@ -147,13 +154,46 @@ local function step(c)
     end
 end
 
+-- Decimal sequence strings without leading zeros compare by length, then lexically.
+local function newer(a, b)
+    if b == nil then return true end
+    if #a ~= #b then return #a > #b end
+    return a > b
+end
+
+-- The oldest command flag (cmd-<seq>.go) newer than the last command run, or nil.
+local function nextFlag()
+    local ok, files = pcall(listFilesInZomboidLuaDirectory, "pzlab")
+    if not ok or not files then return nil end
+    local best
+    for i = 0, files:size() - 1 do
+        local seq = string.match(tostring(files:get(i)), "^cmd%-(%d+)%.go$")
+        if seq and newer(seq, Bridge.lastSeq) and (best == nil or newer(best, seq)) then best = seq end
+    end
+    return best
+end
+
+-- A fresh Lua state (game start, return to the main menu) must not rerun a command whose
+-- flag the controller hasn't deleted yet (e.g. one sent fire-and-forget): resume after the
+-- last answered one.
+if Bridge.lastSeq == nil then
+    local res = PZLab.readFile("res.json")
+    Bridge.lastSeq = res and string.match(res, '"seq":"(%d+)"') or nil
+end
+
 local function poll()
     if Bridge.current then return end
-    local text = PZLab.readFile("cmd.txt")
+    local flagSeq = nextFlag()
+    if not flagSeq then return end
+    Bridge.lastSeq = flagSeq
+    local text = PZLab.readFile("cmd-" .. flagSeq .. ".txt")
     if not text or text == "" then return end
     local seq, timeout, body = string.match(text, "^PZLAB (%S+) (%d+)\n(.*)$")
-    if not seq or seq == Bridge.lastSeq then return end
-    Bridge.lastSeq = seq
+    if seq ~= flagSeq then
+        finish({ seq = flagSeq, out = {}, frames = 0, started = getTimestampMs() }, false, nil,
+            "malformed command file cmd-" .. flagSeq .. ".txt (expected 'PZLAB " .. flagSeq .. " <timeoutMs>' on line 1)")
+        return
+    end
 
     local c = { seq = seq, timeout = tonumber(timeout), started = getTimestampMs(), out = {}, frames = 0 }
     c.deadline = c.started + c.timeout
@@ -189,6 +229,10 @@ local function heartbeat()
         state.player = { x = player:getX(), y = player:getY(), z = player:getZ(), dead = player:isDead() }
         local okSpeed, speed = pcall(getGameSpeed)
         if okSpeed then state.speed = speed end
+        if PZLab.isPauseMenuOpen then
+            local okMenu, open = pcall(PZLab.isPauseMenuOpen)
+            if okMenu then state.pauseMenu = open end
+        end
     end
     PZLab.writeFile("state.json", PZLab.json(state))
 end
@@ -196,6 +240,10 @@ end
 -- One tick per frame: from OnFETick at the menu, OnTickEvenPaused in game.
 function PZLab.tick()
     Bridge.ticks = Bridge.ticks + 1
+    if not Bridge.debuggerOff then
+        Bridge.debuggerOff = true
+        PZLab.disableDebuggerOnError()
+    end
     local c = Bridge.current
     if c then
         c.frames = c.frames + 1

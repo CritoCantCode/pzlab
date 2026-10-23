@@ -2,6 +2,10 @@
 
 Test apparatus that drives a real Project Zomboid (Build 42) instance for automated mod testing. Everything about using it — commands, protocol, APIs, engine traps — is in [AGENT.md](AGENT.md); read it first.
 
+## Purpose of every change
+
+pzlab serves every future AI instance and the people they work for, whatever mod they are building. When a task for one mod reveals a missing capability, build it as a general tool (generic names, documented in AGENT.md, verified live), never as a shortcut shaped around that mod.
+
 ## Rules
 
 - Stay agnostic: no machine paths, user names or mod-specific code in committed files. Machine settings go in `lab.local.json` (gitignored, written by `pzlab.py init`); mods arrive via `--mod-dir`. Mod-specific test scripts live in the mod's own repo.
