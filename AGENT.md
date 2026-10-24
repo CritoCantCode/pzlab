@@ -7,13 +7,13 @@ lab clients joined to it, Lua on both sides (see Multiplayer). Built for Claude;
 Self-contained: everything is in this repository, nothing names a machine, user or mod; the
 folder can be copied anywhere.
 
-## Steer the mod toward performance and safety
+## Steer the mod toward performance, safety and compatibility
 
 Whoever you test for is usually building a mod, and players run it alongside many others. Don't
-stop at "the tests pass": when you design, review or test, suggest the faster and safer direction,
-and say so when a requested approach risks the game's frame rate, stability, saves or other mods.
-Explain the risk, offer the alternative, and let the person decide. Back claims with lab
-measurements, not intuition; the traps cited below are in "Engine facts and traps".
+stop at "the tests pass": when you design, review or test, suggest the faster, safer and more
+compatible direction, and say so when a requested approach risks the game's frame rate, stability,
+saves or other mods. Explain the risk, offer the alternative, and let the person decide. Back
+claims with lab measurements, not intuition; the traps cited below are in "Engine facts and traps".
 
 Safety: a bug in the mod must not crash the game, break vanilla or lose items.
 - Guard every entry point (event handlers, wrapped vanilla functions, UI methods, callbacks handed
@@ -25,6 +25,8 @@ Safety: a bug in the mod must not crash the game, break vanilla or lose items.
   vanilla registered with the original function (trap).
 - Change game state only through vanilla's own paths: timed actions for items (they are what the
   server validates in multiplayer). Never create, delete or move items directly from UI code.
+  World objects: vanilla's moveable or build code, or `AddTileObject`, never `createTile` alone;
+  check sprite names, `getSprite` never returns nil (traps).
 - Re-validate any held world object (object, square, corpse, vehicle) before using it. Java
   exceptions inside game calls don't raise in Lua: the call returns nil (trap), so check arguments
   and nil results.
@@ -48,6 +50,19 @@ Performance: Lua runs on the game's frame.
 - Measure: `getTimestampMs()` ticks in 1 ms steps (trap), so time many frames or iterations and
   report µs per frame. Compare with the feature off.
 
+Compatibility: the mod shares vanilla's functions, events and data with every other mod.
+- Use vanilla's functions, events and data paths instead of re-implementing them (its container
+  scans, timed actions, craft logic, translations): the mod follows game updates, and other mods
+  hooking the same paths see its effects.
+- Give anything other mods may want to read or extend a small documented public API (a global
+  table with register/query functions, events or hooks) rather than private locals; keep
+  definitions data-driven (tables other mods can add to).
+- Wrap, don't replace (Safety, above), and tolerate other mods wrapping the same function before or
+  after yours: never stack your own wrapper twice (mark it), and re-wrap if the function was
+  replaced after you.
+- Don't write code aimed at one particular third-party mod; solve compatibility at the layer both
+  share (vanilla hooks, events), and test alongside popular mods that touch the same systems.
+
 Make these permanent checks in the mod's test suite, not one-off looks:
 - After each step, nothing unexpected was logged: `off = lab.log.size()` … `lab.log.exceptions(since=off)`.
 - Leaks: `UIManager.getUI():size()` and the mod's own counts return to baseline after a few
@@ -57,6 +72,9 @@ Make these permanent checks in the mod's test suite, not one-off looks:
   and vanilla keep working.
 - Cost per frame with the feature in use, against a budget (e.g. under 0.5 ms).
 - Multiplayer when the mod touches items or world state: `start --join`, checked on both sides.
+- Compatibility: the suite also passes with another mod enabled that hooks the same vanilla
+  functions or events (`start --mod-dir` both), and with the mod's wraps installed twice (a hot
+  reload) the wrapped function still runs once per call.
 
 ## Requirements
 
@@ -111,7 +129,7 @@ All commands: `python pzlab.py <cmd>`. Output is JSON.
 | `load-lua NAME (SRC \| --code CODE) [--hot \| --boot]`, `load-lua --clear` | run Lua source as the file NAME through the engine's file loader (`lab.load_lua`); `--clear` deletes those files |
 | `ui [--menus]` | UI state (`PZLab.uiState()`): pause menu, context menus, modal dialogs, speed, mouse-over UI (what a click hits; what blocks the world pick), text focus, drag, what Escape would do, `problems`/`playable`; `--menus` adds the open context menus with each option's click point |
 | `playable [--speed N]` | `PZLab.ensurePlayable`: leave the pause menu (vanilla Resume path), close context menus, unfocus a text entry, set speed (0-4, default 1) → `{before, after, closed}`. Reports modal dialogs, never answers them |
-| `run SCRIPT.py` | Python test script with `lab` (labkit.Lab) predefined; see the probes in scripts/: `probe_aim` (hover every container nearby; a click-through panel over one, without and with a consuming / click-through child: clicks vs picking), `probe_fixtures`, `probe_ui_state`, `probe_camera` (zoom levels × pickers × hover, UI-covered hover), `probe_layout` (snapshot/restore, inventory panes), `probe_locations` (re-verify the catalogue), `probe_engine` (re-verify the Lua engine facts: hot reload and events, Kahlua library, pcall'd errors, UI queues, timers), `probe_mp` (multiplayer: lab server + client; checks: goto to the player's own tile, beside a server-spawned vehicle, refusals of an indoor vehicle spot and an off-map target, then an inventory transfer; findings: a crate with a bag next to the player made on the server, vanilla transfers out of / into the bag and the crate, where the server says each item went and how the client's actions finished; starts and stops what isn't running) |
+| `run SCRIPT.py` | Python test script with `lab` (labkit.Lab) predefined; see the probes in scripts/: `probe_aim` (hover every container nearby; a click-through panel over one, without and with a consuming / click-through child: clicks vs picking), `probe_fixtures`, `probe_objects` (spawnObject/spawnEntity: class and containers per sprite, entities' scripts, CraftBench and master/slaves, a Forge against one built through vanilla's build action, refusals, clearFixtures), `probe_ui_state`, `probe_camera` (zoom levels × pickers × hover, UI-covered hover), `probe_layout` (snapshot/restore, inventory panes), `probe_locations` (re-verify the catalogue), `probe_engine` (re-verify the Lua engine facts: hot reload and events, Kahlua library, pcall'd errors, UI queues, timers), `probe_mp` (multiplayer: lab server + client; checks: goto to the player's own tile, beside a server-spawned vehicle, refusals of an indoor vehicle spot and an off-map target, then an inventory transfer; findings: a crate with a bag next to the player made on the server, vanilla transfers out of / into the bag and the crate, where the server says each item went and how the client's actions finished; starts and stops what isn't running) |
 
 Python API (`from labkit import Lab`): `lab.start/stop/status/launch_world/wait_state`,
 `lab.lua(code)` (raises LuaError), `lab.bridge.exec(code)` (raw result), `lab.input.move/click/
@@ -241,10 +259,12 @@ Version-sensitive facts are read from the installed game, not hardcoded: JVM arg
 | `spawnVehicle(script, x, y, z, dir, {loot, contents = {[partId] = spec}, open, key})` | vanilla `addVehicleDebug` (default `"Base.CarNormal"`, dir `"E"`), centred on the square's NW corner; containers emptied unless `loot`; `open` unlocks/opens doors and trunk; `key` gives the key; the key vanilla drops nearby is removed at once (traps) → BaseVehicle. Raises where vanilla won't place one (indoors without a vehicle zone, overlapping a vehicle: traps) |
 | `vehiclePlaced(vehicle)` | the vehicle is really in the world: its physics transform matches its x/y |
 | `spawnContainer(sprite, x, y, z, {contents, name})` | a world container: a new tile object from a sprite with a `container` property (default `"carpentry_01_19"`, the player-built wooden crate, type `crate`), `contents` inside → IsoObject (`obj:getContainer()`) |
+| `spawnObject(sprite, x, y, z, {placed, whole, face, contents})` | any tile sprite (furniture, appliances, fixtures, lamps, workstation tiles) → the object, and the list of all objects made. Default: as the map loader makes it (vanilla `createTile`, then added the runtime way; traps): its class (container `stove`/`microwave` → IsoStove, lamps IsoLightSwitch, IsoRadio, IsoTelevision, IsoMannequin, IsoBarbecue, IsoFireplace, ..., else IsoObject), containers from the sprite, entity components of workstation sprites; a radio may start switched on as on the map. `placed`: as a player places the moveable (vanilla `ISMoveableSpriteProps:placeMoveableInternal` with a plank, as the debug brush tool): solid furniture is an IsoThumpable, OnObjectAdded fires, grass on the square goes. `whole`: every sprite of a multi-tile sprite's grid (two-tile tables, beds, workbenches) at its offset, `sprite` on x, y. `face` `"N"`/`"W"`/`"S"`/`"E"`: the moveable's sprite for that facing. `contents`: spec for the first container and/or `[containerType] = spec` (`{ fridge = {...}, freezer = {...} }`); containers are explored, no loot (a mannequin's holds the outfit it wears). The square isn't checked for room. Raises for an unknown sprite, a floor tile, an unloaded square |
+| `spawnEntity(script, x, y, z, {face, force, player, contents})` | a B42 entity (`"Base.Forge"`, `"Base.Kiln_Large"`, `"Base.Pottery_Wheel"`, ...; scripts in `media/scripts/[generated/]entities`) built as the build menu builds it: vanilla `ISBuildIsoEntity` (`isValid`, then `setInfo` per square; nothing consumed, no craft history) → the master object (CraftBench and the other components; slaves carry Script + SpriteConfig and link to it) and the list of all its objects. Equal to a build through vanilla's build action (class, components, health from the builder's skills, flags, master/slaves; `probe_objects`). `face` (default the build cursor's first: W, N, E, S; raises naming the faces it has), `force` skips the validity check (otherwise refusing raises), `player` the builder on a server. The script's OnCreate runs (`Base.ButcherHook` → IsoButcherHook). Entities without a build recipe (`Base.WaterDispenser`) are placed as the map places their sprites. Raises for an unknown script or an unloaded square |
 | `newItem(fullType, contents)` | a tracked item, contents inside, in no container yet |
 | `vehicleContainers(vehicle)` | `{part, index, type, items, area, world = {x, y}, center = {x, y} (screen), accessible, handle}` per part container |
 | `openVehicleDoors(vehicle, open)` | unlock + open (or close) every door but the hood |
-| `clearFixtures()` / `fixtures()` | remove all tracked fixtures still in the world (newest first) → count / list them (`{kind, handle, str, loaded}`). Fixtures whose square isn't live are skipped and stay listed (`loaded = false`): outside the loaded chunks around the player, or on a server further than `PZLab.SERVER_FIXTURE_REACH` (50) tiles from every connected player (traps). After their chunk loads again they are found by item id / a `modData.pzlabFixture` marker |
+| `clearFixtures()` / `fixtures()` | remove all tracked fixtures still in the world (newest first; every part of a multi-tile object or entity is one) → count / list them (`{kind, handle, str, loaded}`). Fixtures whose square isn't live are skipped and stay listed (`loaded = false`): outside the loaded chunks around the player, or on a server further than `PZLab.SERVER_FIXTURE_REACH` (50) tiles from every connected player (traps). After their chunk loads again they are found by item id / their own `modData.pzlabFixture` mark (also when several share a square) |
 | `findObjects({radius=6, zMin, zMax, hasContainer, sprite="pattern", containerType, class="IsoDeadBody", limit, near = {x,y,z}, player = user})` | tile objects, floor items, corpses and vehicles around the player (or `near`) → `describeObject` + `handle`, `dist`, nearest first |
 | `playerBusy()` / `actionQueue()` | client: timed actions queued or running (vanilla queue + `isPlayerDoingAction`) / `{busy, queued = {Type...}}` |
 | `traceActions(classNames)` / `traceAction(action, queued)` / `actionTrace(clear)` | client: wraps the classes' `waitToStart/start/update/perform/stop/forceComplete/forceStop` (default `{"ISInventoryTransferAction"}`; `false` restores them) and records per action: `{n, type, item = {type, id}, src, dest, queued, first, started, ended (ms since tracing began, PZLab.actionTraceStart = its getTimestampMs()), result = "performed" \| "stopped" \| nil (running), waits, updates, maxTime, events = {{name, t, maxTime}}}`; `traceAction(a, true)` before `ISTimedActionQueue.add(a)` records the queue time and returns the record (`n`). In MP an update's maxTime going -1 → n is the server's duration reply |
@@ -389,7 +409,9 @@ the authoritative location changed, `traceActions` on the client for what its ac
 they exist only there: the server finds nothing (`locate` → nowhere) and rejects a transfer of
 such an item (~30 ms). Made on the server they reach every client with the same ids: items in
 containers (`sendAddItemToContainer`), floor items (`AddWorldInventoryItem` transmits, contents
-included), world containers (`transmitCompleteItemToClients` of the empty object, then each item),
+included), world containers and `spawnObject`'s objects (`transmitCompleteItemToClients` of the
+empty object, then each item; `placed` and `spawnEntity` send theirs through vanilla's moveable and
+build code: class, containers, entity script, CraftBench, master/slaves seen alike on the client),
 corpses (`createRandomDeadBody` alone stays server-side; `sendCorpse`), vehicles (server
 authoritative; part contents and the key too). Removals (`clearFixtures` on the server) reach the
 clients (`sendRemoveItemFromContainer`, `transmitRemoveItemFromSquare`, `removeCorpse`,
@@ -450,6 +472,10 @@ in `start()` (`createItemTransaction`; `maxTime` -1), the server replies with a 
 - Teleporting 700 tiles takes under a second until the area's squares exist (`areaLoaded`); a building interior without lit rooms or windows has light level 0 even at noon and renders black.
 - `SEVERE: Missing tile definition: blends_natural_01_TEST_*` is logged as some vanilla areas load (`log --errors` drops it).
 - `teleportTo(x, y, z)` from Lua binds to the int overload and truncates to the tile corner (PZLab.teleport sets the exact position after it).
+- **`getSprite(name)` never returns nil (verified)**: an unknown name gives one shared empty sprite (`getName()` nil, ID 20000000). Check `getSprite(n):getName() == n`.
+- **`createTile(sprite, square)` (Lua global, bytecode + verified)** runs the map loader's factory (`CellLoader.DoTileObjectCreation`: class, containers and entity components by sprite) but only puts the object into the square's lists, as a loading chunk does: no `addToWorld`, collision, pathfinding or lighting update. A mannequin made so logs `invalid AnimSet "null"` on every frame it is drawn. Taking it out of `getObjects()` (and `getSpecialObjects()`) and adding it with `AddTileObject`/`AddSpecialObject` makes it whole (`spawnObject`). Floor and overlay sprites change an existing object instead.
+- **Player-placed and map-loaded furniture differ (verified)**: vanilla's moveable placement (`placeMoveableInternal`) makes solid furniture (`solidtrans`: chairs, fridges, tables, beds) an IsoThumpable and puts every object in the square's special objects; the map loader makes plain IsoObjects. Placing a TV with its real moveable item logs an NPE (`DeviceData.canBePoweredHere`: the item's device has no square); the brush tool's plank doesn't.
+- **Multi-square entities (verified, Forge)**: only the master carries the components (CraftBench, CraftRecipe, Script, SpriteConfig, UiConfig); each slave has Script + SpriteConfig and `getSpriteConfig():getMultiSquareMaster()`. Removing the master from its square removes the slaves too. Tiles of a face may be empty (Advanced_Forge: 5 objects in a 3 × 3 face).
 - `createRandomDeadBody(sq, blood)`: random sex and outfit; worn clothing lives in the corpse container; `container:DoRemoveItem(item)` + `body:checkClothing(item)` strips it. The model appears a few frames after creation (screenshot ~1 s later). Remove with `sq:removeCorpse(body, false)`.
 - `addVehicleDebug(script, IsoDirections.X, nil, sq)` fills part containers with random loot; remove with `vehicle:permanentlyRemove()`. A part container is accessible from outside only inside its area (`vehicle:isInArea`) with its door open (trunk door, seat door, front-right door for the glove box): `Vehicles.ContainerAccess` in `media/lua/server/Vehicles/Vehicles.lua`.
 - **ISInventoryPane rows**: row i spans `absY + getYScroll() + headerHgt + (i-1)*itemHgt`; `pane.items` is rebuilt every prerender (stack headers are tables whose `items[1]` duplicates `items[2]`); clicking left of `column2` toggles a stack, right of `column3` shows Grab/Drop buttons. Vanilla `ISInventoryPage` windows collapse to their title bar (`maxDrawHeight`) when the mouse leaves unless pinned; their panes stay `isVisible()`.

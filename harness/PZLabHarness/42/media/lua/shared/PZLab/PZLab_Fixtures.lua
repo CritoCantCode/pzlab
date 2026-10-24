@@ -1,8 +1,9 @@
 -- PZLab fixtures: lab-only world setup a test can create, refer back to by handle and remove
--- again. Items, floor items, world containers, corpses and vehicles made here are tracked;
--- clearFixtures() removes whatever of them still exists, wherever it has moved to. Creation is
--- direct (AddItem, AddWorldInventoryItem, ...) because this is test setup, not gameplay; mods
--- under test must still move items only through vanilla timed actions.
+-- again. Items, floor items, world containers, tile objects (any sprite), B42 entities, corpses
+-- and vehicles made here are tracked; clearFixtures() removes whatever of them still exists,
+-- wherever it has moved to. Creation is direct (AddItem, AddWorldInventoryItem, vanilla's map
+-- loader and build code, ...) because this is test setup, not gameplay; mods under test must
+-- still move items only through vanilla timed actions.
 --
 -- Shared: in single player and on a dedicated (lab) server. On a server every creation and
 -- removal is also sent to the clients (sendAddItemToContainer, transmitCompleteItemToClients,
@@ -33,16 +34,19 @@ local function syncAdd(container, item)
     if PZLab.onServer then sendAddItemToContainer(container, item) end
 end
 
--- Fixture entries: { kind, obj, id (items), at = {x, y, z} (where it was placed) }. Objects,
--- corpses and vehicles also get modData.pzlabFixture: when their chunk unloads and loads again
--- the world holds new Java objects (items keep their ids), which clearFixtures finds again.
+-- Fixture entries: { kind, obj, id (items), mark, at = {x, y, z} (where it was placed) }. Objects,
+-- corpses and vehicles also get modData.pzlabFixture = mark (unique per fixture): when their chunk
+-- unloads and loads again the world holds new Java objects (items keep their ids), which
+-- clearFixtures finds again by that mark, also when several fixtures share a square.
 local function track(kind, obj)
     local list = PZLab.fixtureList
     local entry = { kind = kind, obj = obj }
     if kind == "item" then
         entry.id = obj:getID()
     else
-        obj:getModData().pzlabFixture = true
+        PZLab.fixtureSeq = (PZLab.fixtureSeq or 0) + 1
+        entry.mark = PZLab.fixtureSeq
+        obj:getModData().pzlabFixture = entry.mark
         local sq = obj:getSquare()
         if sq then entry.at = { sq:getX(), sq:getY(), sq:getZ() } end
     end
@@ -73,6 +77,14 @@ local function squareOrError(x, y, z)
         error(string.format("no loaded square at %s,%s,%s", tostring(x), tostring(y), tostring(z or 0)))
     end
     return sq
+end
+
+-- The sprite of that name, or an error. getSprite never returns nil: an unknown name gives one
+-- shared empty sprite whose getName() is nil (42.21).
+local function spriteOrError(name)
+    local sprite = type(name) == "string" and getSprite(name) or nil
+    if not sprite or sprite:getName() ~= name then error("unknown sprite '" .. tostring(name) .. "'") end
+    return sprite
 end
 
 -- Anything that holds items -> its ItemContainer: an ItemContainer, a container item, a
@@ -333,7 +345,7 @@ function PZLab.spawnContainer(sprite, x, y, z, opts)
     opts = opts or {}
     sprite = sprite or "carpentry_01_19"
     local sq = squareOrError(x, y, z)
-    if not getSprite(sprite) then error("unknown sprite '" .. tostring(sprite) .. "'") end
+    spriteOrError(sprite)
     local obj = IsoObject.new(sq, sprite, opts.name, false)
     -- the constructor doesn't make the sprite's container (property "container", e.g. "crate")
     if not obj:getContainer() then obj:createContainersFromSpriteProperties() end
@@ -348,6 +360,293 @@ function PZLab.spawnContainer(sprite, x, y, z, opts)
     notePlaces(mark)
     triggerEvent("OnContainerUpdate")
     return obj
+end
+
+---------------------------------------------------------------------------------------------
+-- World objects from tile sprites, and B42 entities
+---------------------------------------------------------------------------------------------
+
+local FACES = { "N", "W", "S", "E" }
+
+-- The square's objects as a set (floor items included, so they are never taken for new objects).
+local function objectSet(sq)
+    local set, objects = {}, sq:getObjects()
+    for i = 0, objects:size() - 1 do set[objects:get(i)] = true end
+    return set
+end
+
+-- Objects on the square that weren't in `before`.
+local function newObjects(sq, before)
+    local found, objects = {}, sq:getObjects()
+    for i = 0, objects:size() - 1 do
+        local obj = objects:get(i)
+        if not before[obj] then found[#found + 1] = obj end
+    end
+    return found
+end
+
+-- A tile object made the way a loading map makes it. Vanilla createTile(sprite, square) runs the
+-- map loader's factory (CellLoader.DoTileObjectCreation: the Java class for the sprite, e.g.
+-- IsoStove, IsoLightSwitch, IsoRadio, IsoTelevision, IsoMannequin, else IsoObject; containers from
+-- the sprite properties; entity components of workstation sprites) and puts the object straight
+-- into the square's lists, as a chunk being loaded does, without adding it to the live world (a
+-- mannequin then throws on every frame it renders). So each new object is taken out of the lists
+-- again and added the way runtime additions are (AddSpecialObject / AddTileObject: addToWorld,
+-- recalculation, collision, pathfinding, lighting, rendering). Returns the new objects; none when
+-- the sprite was merged into an existing object (an overlay).
+local function placeAsMap(sq, spriteName)
+    local before = objectSet(sq)
+    createTile(spriteName, sq)
+    local made = newObjects(sq, before)
+    local objects, specials = sq:getObjects(), sq:getSpecialObjects()
+    for _, obj in ipairs(made) do
+        local special = specials:contains(obj)
+        objects:remove(obj)
+        if special then
+            specials:remove(obj)
+            sq:AddSpecialObject(obj)
+        else
+            sq:AddTileObject(obj)
+        end
+    end
+    return made
+end
+
+-- A tile object placed the way a player places a moveable: vanilla
+-- ISMoveableSpriteProps:placeMoveableInternal with a plank as the carried item, as the debug brush
+-- tool (ISBrushToolTileCursor) and prop entities (ISBuildIsoEntity:setInfo) do. Solid furniture
+-- becomes an IsoThumpable; containers are explored; OnObjectAdded fires; a server sends it to the
+-- clients; grass on the square is removed. Returns the new objects.
+local function placeAsMoveable(sq, spriteName, character)
+    local before = objectSet(sq)
+    local props = ISMoveableSpriteProps.new(spriteName)
+    props.rawWeight = 10
+    props:placeMoveableInternal(character, sq, instanceItem("Base.Plank"), spriteName)
+    return newObjects(sq, before)
+end
+
+-- Fills the containers of a fixture's objects: list entries (spec) go into the first container,
+-- [containerType] = spec into the first container of that type (e.g. { fridge = {...}, freezer = {...} }).
+local function fillContents(parts, contents)
+    if not contents then return end
+    local list, byType = {}, {}
+    for k, v in pairs(contents) do
+        if type(k) == "number" then list[k] = v else byType[k] = v end
+    end
+    local function find(containerType)
+        for _, obj in ipairs(parts) do
+            for c = 0, obj:getContainerCount() - 1 do
+                local container = obj:getContainerByIndex(c)
+                if containerType == nil or container:getType() == containerType then return container end
+            end
+        end
+        error(containerType and ("no '" .. tostring(containerType) .. "' container to put contents in")
+            or "the object has no container to put contents in")
+    end
+    if #list > 0 then addSpec(find(nil), list, nil, true) end
+    for containerType, spec in pairs(byType) do addSpec(find(containerType), spec, nil, true) end
+end
+
+-- After placing (every part already tracked): containers explored, so they hold exactly
+-- `contents` (no loot); objects in `transmit` sent to the clients on a server (placeAsMap's; the
+-- moveable and build paths send their own); then the contents, item by item (see spawnContainer).
+local function finishObjects(parts, transmit, contents)
+    local hasContainer = false
+    for _, obj in ipairs(parts) do
+        for c = 0, obj:getContainerCount() - 1 do
+            obj:getContainerByIndex(c):setExplored(true)
+            hasContainer = true
+        end
+        if transmit[obj] and PZLab.onServer then obj:transmitCompleteItemToClients() end
+    end
+    local mark = #PZLab.fixtureList
+    fillContents(parts, contents)
+    notePlaces(mark)
+    if hasContainer then triggerEvent("OnContainerUpdate") end
+end
+
+-- The moveable sprite for another facing (vanilla ISMoveableSpriteProps:getFaces).
+local function faceSprite(spriteName, face)
+    local faces = ISMoveableSpriteProps.new(spriteName):getFaces()
+    local name = faces[string.upper(tostring(face))]
+    if not name then
+        local have = {}
+        for _, f in ipairs(FACES) do
+            if faces[f] then have[#have + 1] = f end
+        end
+        error(string.format("sprite '%s' has no face '%s' (faces: %s)", spriteName, tostring(face),
+            #have > 0 and table.concat(have, ", ") or "none, it is not a rotatable moveable"))
+    end
+    return name
+end
+
+-- A world object from any tile sprite: furniture, appliances, fixtures, lamps, ... By default as
+-- the map loader makes it (placeAsMap: the class and containers a map-loaded one has); with
+-- opts.placed as a player places the moveable (placeAsMoveable: solid furniture is an
+-- IsoThumpable). opts: placed, whole (a multi-tile sprite such as a two-tile table or a bed: every
+-- sprite of its grid at its offset, this sprite on x, y), face ("N", "W", "S", "E": the moveable's
+-- sprite for that facing instead), contents (spec for the first container and/or
+-- [containerType] = spec). Containers hold exactly `contents` (a mannequin's also the outfit it
+-- wears). The square is not checked for room. On a server the objects reach the clients.
+-- Returns the object of `sprite` and the list of all objects made (that one first).
+function PZLab.spawnObject(sprite, x, y, z, opts)
+    checkSide()
+    opts = opts or {}
+    z = z or 0
+    spriteOrError(sprite)
+    if opts.face then sprite = faceSprite(sprite, opts.face) end
+    local s = spriteOrError(sprite)
+    if s:getProperties():has(IsoFlagType.solidfloor) then
+        error("'" .. sprite .. "' is a floor tile, not an object (the map loader would replace the square's floor)")
+    end
+    local tiles = { { square = squareOrError(x, y, z), sprite = sprite } }
+    local grid = opts.whole and s:getSpriteGrid()
+    if grid then
+        local ax, ay = x - grid:getSpriteGridPosX(s), y - grid:getSpriteGridPosY(s)
+        for gy = 0, grid:getHeight() - 1 do
+            for gx = 0, grid:getWidth() - 1 do
+                local member = grid:getSprite(gx, gy)
+                if member and member:getName() ~= sprite then
+                    tiles[#tiles + 1] = { square = squareOrError(ax + gx, ay + gy, z), sprite = member:getName() }
+                end
+            end
+        end
+    end
+    local character = PZLab.player()
+    local parts, transmit = {}, {}
+    for _, tile in ipairs(tiles) do
+        local made
+        if opts.placed then
+            made = placeAsMoveable(tile.square, tile.sprite, character)
+        else
+            made = placeAsMap(tile.square, tile.sprite)
+        end
+        for _, obj in ipairs(made) do
+            track("object", obj)
+            parts[#parts + 1] = obj
+            if not opts.placed then transmit[obj] = true end
+        end
+        if #made == 0 then
+            error(string.format("no new object for sprite '%s' at %d,%d,%d: it was merged into an existing object (an overlay)",
+                tile.sprite, tile.square:getX(), tile.square:getY(), tile.square:getZ()))
+        end
+    end
+    finishObjects(parts, transmit, opts.contents)
+    return parts[1], parts
+end
+
+-- ISBuildIsoEntity.nSprite (the build cursor's rotation, 1-4) of each facing.
+local ENTITY_FACE_INDEX = { W = 1, N = 2, E = 3, S = 4 }
+
+-- An entity script's SpriteConfigManager object info, found as the debug Entity scripts panel does.
+local function entityInfo(scriptName)
+    local script = type(scriptName) == "string" and ScriptManager.instance:getGameEntityScript(scriptName) or nil
+    if not script then error("unknown entity script '" .. tostring(scriptName) .. "'") end
+    local config = script:getComponentScriptFor(ComponentType.SpriteConfig)
+    if not config then error("entity '" .. scriptName .. "' has no SpriteConfig component: it has no world object") end
+    local infos = SpriteConfigManager.GetObjectInfoList()
+    for i = 0, infos:size() - 1 do
+        if infos:get(i):getScript() == config then return infos:get(i) end
+    end
+    error("no sprite configuration loaded for entity '" .. scriptName .. "'")
+end
+
+-- A B42 entity (workstation, furniture, ...) from its entity script, built as the build menu
+-- builds it: vanilla ISBuildIsoEntity (the build cursor's object), its validity check (isValid:
+-- free squares, a floor, no wall between its squares, the script's OnIsValid; materials are not
+-- needed) and its per-square placement (setInfo: an IsoThumpable per square, health from the
+-- builder's skills, components from the script via GameEntityFactory.CreateIsoObjectEntity,
+-- multi-square master and slaves, the script's OnCreate, sent to the clients on a server). Nothing
+-- is consumed and no craft history is recorded. Entities without a build recipe (world-only ones,
+-- e.g. Base.WaterDispenser) are placed as the map loader places their sprites (placeAsMap).
+-- opts: face ("N", "W", "S", "E"; default the build cursor's first: W, else N, E, S), force (skip
+-- the validity check), player (server: the builder's username; default PZLab.player()), contents
+-- (as spawnObject). Returns the master object (it carries CraftBench and the other components) and
+-- the list of all its objects.
+function PZLab.spawnEntity(scriptName, x, y, z, opts)
+    checkSide()
+    opts = opts or {}
+    z = z or 0
+    local info = entityInfo(scriptName)
+    local character = PZLab.player(opts.player)
+    if not character then
+        error("spawnEntity needs a player: the build path reads the builder's skills (on a server: a connected player, opts.player)")
+    end
+    local nSprite = 1
+    if opts.face then
+        local f = string.upper(tostring(opts.face))
+        if not (ENTITY_FACE_INDEX[f] and info:getFace(f)) then
+            local have = {}
+            for _, name in ipairs(FACES) do
+                if info:getFace(name) then have[#have + 1] = name end
+            end
+            error(string.format("entity '%s' has no face '%s' (faces: %s)", scriptName, tostring(opts.face), table.concat(have, ", ")))
+        end
+        nSprite = ENTITY_FACE_INDEX[f]
+    end
+    local recipe = info:getRecipe() and info:getRecipe():getCraftRecipe()
+    -- the BuildLogic ISBuildIsoEntity:new makes itself, minus setRecipe(false) when there is no recipe
+    local logic = BuildLogic.new(character, nil, nil)
+    logic:setContainers(ArrayList.new())
+    if recipe then logic:setRecipe(recipe) end
+    local build = ISBuildIsoEntity:new(character, info, nSprite, ArrayList.new(), logic)
+    build.player = character:getPlayerNum()
+    build.haveMaterial = function() return true end
+    build:getSprite() -- sets build.north from the rotation, as the server does before create()
+    local face = build:getFace()
+    if not face then error("entity '" .. scriptName .. "' has no face to build") end
+    local tiles = {}
+    for zz = 0, face:getzLayers() - 1 do
+        for xx = 0, face:getWidth() - 1 do
+            for yy = 0, face:getHeight() - 1 do
+                local tileInfo = face:getTileInfo(xx, yy, zz)
+                if tileInfo and zz == 0 and (tileInfo:getSpriteName() or tileInfo:isBlocking()) then
+                    squareOrError(x + xx, y + yy, z)
+                end
+                if tileInfo and tileInfo:getSpriteName() then tiles[#tiles + 1] = { xx, yy, zz, tileInfo } end
+            end
+        end
+    end
+    build:ensureSquaresExist(x, y, z) -- squares of upper layers, as the build cursor makes them
+    if not opts.force and not build:isValid(PZLab.square(x, y, z)) then
+        error(string.format("vanilla's build check (ISBuildIsoEntity:isValid) refuses '%s' facing %s at %d,%d,%d: "
+            .. "something in the way, no floor or a wall between its squares (opts.force skips the check)",
+            scriptName, string.upper(face:getFaceName()), x, y, z))
+    end
+    local openFace = build:getOpenFace(build.north)
+    if openFace and (openFace:getWidth() ~= face:getWidth() or openFace:getHeight() ~= face:getHeight()) then openFace = nil end
+    local parts, transmit, master = {}, {}, nil
+    local function place()
+        for _, t in ipairs(tiles) do
+            local tileInfo = t[4]
+            local sq = PZLab.square(x + t[1], y + t[2], z + t[3])
+            local made
+            if recipe then
+                local before = objectSet(sq)
+                local openInfo = openFace and openFace:getTileInfo(t[1], t[2], t[3])
+                build:setInfo(sq, build.north, tileInfo:getSpriteName(), openInfo and openInfo:getSpriteName() or false)
+                made = newObjects(sq, before)
+            else
+                made = placeAsMap(sq, tileInfo:getSpriteName())
+            end
+            for _, obj in ipairs(made) do
+                track("object", obj)
+                parts[#parts + 1] = obj
+                if not recipe then transmit[obj] = true end
+                if tileInfo:isMaster() and not master then master = obj end
+            end
+        end
+    end
+    -- A light source (script lightRadius, e.g. a lamp on a pillar) comes from the consumed torch,
+    -- or under build cheat from the script's debugItem: cheat on for the placement only.
+    local cheat = recipe and info:getScript():getLightRadius() > 0 and not character:isBuildCheat()
+    if cheat then character:setBuildCheat(true) end
+    local ok, err = pcall(place)
+    if cheat then character:setBuildCheat(false) end
+    if not ok then error(err) end
+    if #parts == 0 then error("building '" .. scriptName .. "' made no object") end
+    finishObjects(parts, transmit, opts.contents)
+    return master or parts[1], parts
 end
 
 -- The vehicle's part containers: { part, index, type, items, area, world = {x, y} (area
@@ -517,7 +816,7 @@ local function refresh(f)
         candidates[1] = sq:getVehicleContainer()
     end
     for _, obj in ipairs(candidates) do
-        if obj ~= f.obj and obj:hasModData() and obj:getModData().pzlabFixture then
+        if obj ~= f.obj and obj:hasModData() and obj:getModData().pzlabFixture == f.mark then
             f.obj = obj
             return true
         end

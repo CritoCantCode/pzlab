@@ -6,7 +6,7 @@ Test apparatus that drives a real Project Zomboid (Build 42) instance for automa
 
 pzlab serves every future AI instance and the people they work for, whatever mod they are building. When a task for one mod reveals a missing capability, build it as a general tool (generic names, documented in AGENT.md, verified live), never as a shortcut shaped around that mod.
 
-AGENT.md opens with "Steer the mod toward performance and safety": agents using pzlab should propose fast, safe directions for the mod, not just make its tests pass. When you verify a new engine trap that bears on a mod's speed or stability, add it there too (one line, citing the trap).
+AGENT.md opens with "Steer the mod toward performance, safety and compatibility": agents using pzlab should propose fast, safe directions for the mod that coexist with vanilla and other mods (vanilla paths over re-implementations, a public API for what others may extend, wraps that tolerate other wraps), not just make its tests pass. When you verify a new engine trap that bears on a mod's speed, stability or interoperability, add it there too (one line, citing the trap).
 
 ## Rules
 
